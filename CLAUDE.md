@@ -10,10 +10,12 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Serves web dashboard at http://localhost:7899.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications. Auto-reconnects if broker restarts.
 - `shared/types.ts` — Shared TypeScript types for broker API.
-- `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
+- `shared/summarize.ts` — Git context utilities (branch, recent files).
+- `shared/log.ts` — Structured logging utility (respects LOG_LEVEL env var).
+- `dashboard.html` — Web dashboard served by the broker.
 - `cli.ts` — CLI utility for inspecting broker state.
 
 ## Running
@@ -25,10 +27,15 @@ claude --dangerously-load-development-channels server:claude-peers
 # Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
 # { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
 
+# Web dashboard:
+# Open http://localhost:7899 in your browser
+
 # CLI:
 bun cli.ts status
 bun cli.ts peers
 bun cli.ts send <peer-id> <message>
+bun cli.ts broadcast <machine|directory|repo> <message>
+bun cli.ts groups
 bun cli.ts kill-broker
 ```
 
