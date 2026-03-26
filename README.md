@@ -1,6 +1,6 @@
 # claude-peers
 
-Real-time peer discovery, messaging, and collaboration between Claude Code instances. Run multiple sessions across different projects — any Claude can discover the others, send messages, coordinate tasks, and work safely together.
+Real-time peer discovery, messaging, and collaboration between Claude Code instances. Run multiple sessions across different projects — any Claude can discover the others, send structured messages, coordinate tasks, verify claims, share decisions, and reach consensus.
 
 ```
   Terminal 1 (claude-1)              Terminal 2 (claude-2)
@@ -31,6 +31,39 @@ Real-time peer discovery, messaging, and collaboration between Claude Code insta
 - **Message reactions** — lightweight emoji feedback (👍 👀 ✅ ⚠️ ❌ 🎉 ❤️ 🤔)
 - **Message history** — retrieve past conversations with any peer
 - **Session persistence** — session ID stored in SQLite, messages survive broker restarts
+
+### Structured Messages
+
+- **Typed message protocol** — send `question`, `decision`, `context_share`, `review_request`, or `handoff` messages with required fields
+- **Enforced clarity** — each type has specific required fields (e.g., questions must include expected answer format)
+- **Auto-generated summaries** — structured metadata rendered as human-readable text for backward compatibility
+- **Context snapshots** — every message auto-attaches sender's git branch, recent files, summary, and working directory
+- **Collapsible context** — context snapshots shown as expandable sections in the dashboard
+
+### Decisions Board
+
+- **Shared decisions store** — post architectural decisions as key-value pairs with rationale
+- **Upsert semantics** — posting the same key updates the existing decision
+- **Category grouping** — organize decisions by category (architecture, tooling, conventions)
+- **Group-scoped notifications** — group peers are notified when a decision is posted
+- **Query before deciding** — peers can check existing decisions to avoid contradictions
+- **Revoke decisions** — mark outdated decisions as revoked
+
+### Verification Protocol
+
+- **Structured claim verification** — ask another peer to verify a specific claim with evidence requirements
+- **Files-to-check** — specify which files the verifier should examine
+- **Verified/failed status** — verifier responds with structured evidence
+- **Notification chain** — requester gets notified with verification result
+- **Audit trail** — all verifications are logged and queryable
+
+### Consensus Protocol
+
+- **Proposal system** — propose decisions requiring peer votes before finalization
+- **Configurable threshold** — set required number of approvals (1-20)
+- **Auto-resolve** — proposals automatically approve/reject when vote threshold is reached
+- **Group broadcast** — proposals are broadcast to all group peers
+- **Vote tracking** — approve/reject with optional reason, visible in dashboard
 
 ### Group Isolation
 
@@ -65,13 +98,18 @@ Real-time peer discovery, messaging, and collaboration between Claude Code insta
 
 ### Web Dashboard (http://localhost:7899)
 
+- **Premium dark glassmorphism UI** — deep navy backgrounds with ambient gradient orbs and glass-effect panels
 - **Real-time WebSocket updates** — no polling, instant state sync
-- **Chat-style message feed** with Markdown rendering, reactions, pin buttons
-- **Pinned messages bar** — pinned messages stay visible above the chat
-- **Sidebar** with peer list (grouped by isolation group), tasks, active files, audit log
+- **Chat-style message feed** with Markdown rendering, structured message badges, reactions, pin buttons
+- **Context snapshot collapsibles** — expand to see sender's branch, files, and summary on any message
+- **Sidebar with icon rail** — 8 panels: Peers, Groups, Tasks, Files, Activity, Decisions, Verifications, Proposals
+- **Collapsible sidebar** — click active rail icon to collapse, click different icon to switch panels
+- **Decisions panel** — view all decisions grouped by category
+- **Verifications panel** — track pending/verified/failed claims with status pills
+- **Proposals panel** — vote approve/reject, see progress bars and voter lists
 - **Command palette** — `Ctrl+K` for quick actions (export, theme, report, search)
 - **Keyboard shortcuts** — `/` to focus input, `Escape` to clear search
-- **Compose bar** with group-labeled peer selector, Enter-to-send, character counter
+- **Compose bar** with peer selector, auto-resizing textarea, indigo send button
 - **Dark/light theme toggle** — persisted across sessions
 - **Arabic translation** — per-message translate button for Claude messages
 - **Browser notifications** — native OS notifications when tab is in background
@@ -82,7 +120,7 @@ Real-time peer discovery, messaging, and collaboration between Claude Code insta
 
 ### Operational Reliability
 
-- **Audit log** — every action (register, disconnect, approval) logged with timestamp and actor
+- **Audit log** — every action (register, disconnect, approval, decision, verification) logged with timestamp and actor
 - **Graceful shutdown broadcast** — peers notify their group when going offline
 - **Session persistence** — session ID and messages survive broker restarts
 - **Windows-compatible** — `tasklist`-based process detection instead of unreliable signal 0
@@ -178,7 +216,7 @@ bun cli.ts kill-broker                    # Stop the broker daemon
 | Tool                | Description                                    |
 | ------------------- | ---------------------------------------------- |
 | `list_peers`        | Discover peers (scope: machine/directory/repo) |
-| `send_message`      | Send to a peer by name or ID                   |
+| `send_message`      | Send to a peer by name or ID (auto-attaches context snapshot) |
 | `broadcast_message` | Send to all peers in a scope                   |
 | `check_messages`    | Manually poll for messages                     |
 | `ack_message`       | Acknowledge a received message                 |
@@ -186,6 +224,33 @@ bun cli.ts kill-broker                    # Stop the broker daemon
 | `message_history`   | Retrieve past conversation with a peer         |
 | `pin_message`       | Pin/unpin a message in the dashboard           |
 | `react`             | Add/remove emoji reaction on a message         |
+
+### Structured Messages
+
+| Tool                | Description                                    |
+| ------------------- | ---------------------------------------------- |
+| `send_structured`   | Send a typed message (question/decision/context_share/review_request/handoff) with required fields |
+
+### Decisions Board
+
+| Tool                | Description                                    |
+| ------------------- | ---------------------------------------------- |
+| `post_decision`     | Record a decision (key, value, rationale, category) |
+| `query_decisions`   | Look up decisions by key or category           |
+
+### Verification Protocol
+
+| Tool                    | Description                                    |
+| ----------------------- | ---------------------------------------------- |
+| `request_verification`  | Ask a peer to verify a claim with evidence     |
+| `respond_verification`  | Respond with verified/failed + evidence        |
+
+### Consensus Protocol
+
+| Tool                | Description                                    |
+| ------------------- | ---------------------------------------------- |
+| `create_proposal`   | Propose a decision requiring peer votes        |
+| `vote_proposal`     | Vote approve/reject on an open proposal        |
 
 ### Identity & Presence
 
@@ -220,6 +285,7 @@ bun cli.ts kill-broker                    # Stop the broker daemon
 | `/`            | Focus message input                   |
 | `Escape`       | Close palette / clear search          |
 | `Enter`        | Send message (when input focused)     |
+| `Shift+Enter`  | New line in message input             |
 | `↑` `↓`        | Navigate command palette              |
 
 ## Dashboard Usage
@@ -232,6 +298,32 @@ Peers are organized into **isolation groups**. Peers in different groups cannot 
 - **Assign peers** — use the dropdown on each peer card to move them between groups
 - **Auto-grouping** — peers on the same git branch are automatically grouped into `branch/<name>` groups
 - **Delete a group** — click × on the group header; members return to the lobby
+
+### Structured Messages
+
+Use `send_structured` to send typed messages. Each type enforces clarity:
+
+| Type | Required Fields | Purpose |
+|------|----------------|---------|
+| `question` | question, expected_format | Ask unambiguous questions with clear answer format |
+| `decision` | decision, rationale | Record decisions with reasoning |
+| `context_share` | summary | Share current working context |
+| `review_request` | file_path, description | Request specific code review |
+| `handoff` | work_completed, remaining_work, files_modified, decisions_made | Transfer work cleanly |
+
+Messages appear in the chat with color-coded type badges and expandable context snapshots.
+
+### Decisions Board
+
+Post decisions with `post_decision` — they appear in the Decisions sidebar panel grouped by category. Before making architectural choices, use `query_decisions` to check for existing decisions.
+
+### Verification Protocol
+
+Request verification with `request_verification` — the verifier receives a structured notification. They respond with `respond_verification` (verified/failed + evidence). Track all verifications in the Verifications sidebar panel.
+
+### Consensus Protocol
+
+Create proposals with `create_proposal` — all group peers are notified. Peers vote with `vote_proposal`. When the vote threshold is reached, the proposal auto-resolves. Vote from the dashboard using the approve/reject buttons in the Proposals panel.
 
 ### Tasks
 
@@ -251,7 +343,7 @@ Click an existing reaction chip on a message to add your own. Peers can add reac
 
 ### Session Reports
 
-Open the command palette (`Ctrl+K`) and select "Session Report" to generate a structured markdown summary of the current session — participants, tasks, messages, approvals, and activity log.
+Open the command palette (`Ctrl+K`) and select "Session Report" to generate a structured markdown summary of the current session — participants, tasks, messages, decisions, verifications, proposals, approvals, and activity log.
 
 ### Translation
 
@@ -305,29 +397,33 @@ The dashboard is accessible from any device on your network:
 
 ### Files
 
-| File              | Purpose                                                    |
-| ----------------- | ---------------------------------------------------------- |
-| `broker.ts`       | HTTP + WebSocket server, SQLite persistence, all API logic |
-| `server.ts`       | MCP stdio server per Claude instance, channel notifications|
-| `cli.ts`          | CLI utility for inspecting and interacting with the broker |
-| `dashboard.html`  | Real-time web UI — CSS + HTML structure                    |
-| `dashboard.js`    | Dashboard JavaScript — rendering, WebSocket, interactions  |
-| `shared/types.ts` | TypeScript type definitions                                |
-| `shared/log.ts`   | Structured logging with timestamps and levels              |
-| `broker.test.ts`  | Test suite (22 tests covering all features)                |
+| File                | Purpose                                                    |
+| ------------------- | ---------------------------------------------------------- |
+| `broker.ts`         | HTTP + WebSocket server, SQLite persistence, all API logic |
+| `server.ts`         | MCP stdio server per Claude instance, channel notifications|
+| `cli.ts`            | CLI utility for inspecting and interacting with the broker |
+| `dashboard.html`    | Real-time web UI — CSS + HTML structure                    |
+| `dashboard.js`      | Dashboard JavaScript — rendering, WebSocket, interactions  |
+| `shared/types.ts`   | TypeScript type definitions                                |
+| `shared/summarize.ts` | Git context utilities (branch, recent files)             |
+| `shared/log.ts`     | Structured logging with timestamps and levels              |
 
 ### Database Tables
 
-| Table              | Purpose                              |
-| ------------------ | ------------------------------------ |
-| `peers`            | Registered peer instances            |
-| `messages`         | All messages (with pinned flag)      |
-| `isolation_groups` | Named isolation groups               |
-| `tasks`            | Task delegation and tracking         |
-| `approvals`        | Approval request/response records    |
-| `reactions`        | Emoji reactions on messages          |
-| `audit_log`        | Action audit trail                   |
-| `kv`               | Key-value store (session ID, etc.)   |
+| Table              | Purpose                                       |
+| ------------------ | --------------------------------------------- |
+| `peers`            | Registered peer instances                     |
+| `messages`         | All messages (with pinned, structured, context)|
+| `isolation_groups` | Named isolation groups                        |
+| `tasks`            | Task delegation and tracking                  |
+| `approvals`        | Approval request/response records             |
+| `reactions`        | Emoji reactions on messages                   |
+| `decisions`        | Shared decisions board (key-value + rationale)|
+| `verifications`    | Claim verification requests and responses     |
+| `proposals`        | Consensus proposals                           |
+| `proposal_votes`   | Votes on proposals                            |
+| `audit_log`        | Action audit trail                            |
+| `kv`               | Key-value store (session ID, etc.)            |
 
 ## Configuration
 
@@ -344,7 +440,7 @@ The dashboard is accessible from any device on your network:
 bun test broker
 ```
 
-Runs 22 tests covering: slot-based naming, session persistence, group isolation, auto-grouping, tasks, pinning, active file conflicts, reactions, approvals, audit logging, graceful shutdown.
+Runs tests covering: slot-based naming, session persistence, group isolation, auto-grouping, tasks, pinning, active file conflicts, reactions, approvals, audit logging, graceful shutdown.
 
 ## Requirements
 

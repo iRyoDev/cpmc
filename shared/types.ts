@@ -26,6 +26,9 @@ export interface Message {
   sent_at: string; // ISO timestamp
   delivered: boolean;
   acknowledged: boolean;
+  msg_type?: StructuredMessageType | null;
+  metadata?: string | null; // JSON string of type-specific fields
+  context_snapshot?: string | null; // JSON string of ContextSnapshot
 }
 
 // --- Broker API types ---
@@ -179,4 +182,77 @@ export interface ActiveFilesEntry {
   peer_id: PeerId;
   peer_name: string;
   files: string[];
+}
+
+// --- Structured Messages ---
+
+export type StructuredMessageType = "question" | "decision" | "context_share" | "review_request" | "handoff";
+
+export interface ContextSnapshot {
+  branch: string | null;
+  recent_files: string[];
+  summary: string;
+  cwd: string;
+}
+
+// --- Decisions Board ---
+
+export interface Decision {
+  id: string;
+  key: string;
+  value: string;
+  rationale: string;
+  author_id: PeerId;
+  author_name: string;
+  category: string;
+  status: "active" | "revoked";
+  group_id: string | null;
+  created_at: string;
+  updated_at: string;
+  session_id: string;
+}
+
+// --- Verification Protocol ---
+
+export interface Verification {
+  id: string;
+  requester_id: PeerId;
+  verifier_id: PeerId;
+  claim: string;
+  evidence_needed: string;
+  files_to_check: string; // JSON array
+  status: "pending" | "verified" | "failed";
+  response: string;
+  evidence: string;
+  group_id: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  session_id: string;
+}
+
+// --- Consensus Protocol ---
+
+export interface Proposal {
+  id: string;
+  author_id: PeerId;
+  author_name: string;
+  title: string;
+  description: string;
+  required_votes: number;
+  status: "open" | "approved" | "rejected";
+  group_id: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  session_id: string;
+  votes: ProposalVote[];
+}
+
+export interface ProposalVote {
+  id: string;
+  proposal_id: string;
+  voter_id: PeerId;
+  voter_name: string;
+  vote: "approve" | "reject";
+  reason: string;
+  created_at: string;
 }

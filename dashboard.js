@@ -386,7 +386,10 @@ function render(d) {
       af: activeFiles.map(function (a) { return a.peer_id + ':' + a.files.length; }).join(','),
       rx: JSON.stringify(d.reactions || {}),
       au: (d.audit || []).length,
-      ap: (d.approvals || []).length
+      ap: (d.approvals || []).length,
+      dec: (d.decisions || []).length,
+      ver: (d.verifications || []).length,
+      prop: (d.proposals || []).map(function (p) { return p.id + '_' + (p.votes || []).length + '_' + p.status; }).join(',')
     });
     if (hash === lastHash) return;
     lastHash = hash;
@@ -396,6 +399,9 @@ function render(d) {
     document.getElementById('gc').textContent = String(d.groups.length);
     document.getElementById('tc').textContent = String(tasks.filter(function (t) { return t.status !== 'completed'; }).length);
     document.getElementById('fc').textContent = String(activeFiles.reduce(function (n, a) { return n + a.files.length; }, 0));
+    document.getElementById('dc').textContent = String((d.decisions || []).filter(function (x) { return x.status === 'active'; }).length);
+    document.getElementById('vc').textContent = String((d.verifications || []).filter(function (x) { return x.status === 'pending'; }).length);
+    document.getElementById('prc').textContent = String((d.proposals || []).filter(function (x) { return x.status === 'open'; }).length);
 
     /* Browser notification for new messages */
     if (lastMsgCount !== null && d.messages.length > lastMsgCount && document.hidden) {
@@ -590,6 +596,98 @@ function render(d) {
       }));
     }
 
+    /* Name map (used by panels and chat) */
+    var nm = {}; d.peers.forEach(function (p) { nm[p.id] = p.name || p.id; });
+    nm['dashboard'] = 'You'; nm['cli'] = 'CLI';
+
+    /* Sidebar: Decisions */
+    var dl = document.getElementById('decision-list');
+    var decisions = d.decisions || [];
+    if (decisions.length === 0) { clr(dl, el('div', { class: 'empty-hint' }, 'No decisions recorded')); }
+    else {
+      var cats = {};
+      decisions.forEach(function (dec) { if (!cats[dec.category]) cats[dec.category] = []; cats[dec.category].push(dec); });
+      var decNodes = [];
+      Object.keys(cats).forEach(function (cat) {
+        decNodes.push(el('div', { class: 'dec-cat-header' }, cat));
+        cats[cat].forEach(function (dec) {
+          var isRevoked = dec.status === 'revoked';
+          decNodes.push(el('div', { class: 'dec-card' + (isRevoked ? ' dec-revoked' : '') }, [
+            el('div', { class: 'dec-key' }, dec.key),
+            el('div', { class: 'dec-val' }, dec.value),
+            dec.rationale ? el('div', { class: 'dec-rationale' }, dec.rationale) : null,
+            el('div', { class: 'dec-meta' }, [
+              el('span', null, dec.author_name || dec.author_id),
+              el('span', null, fmt(dec.updated_at)),
+            ]),
+          ]));
+        });
+      });
+      clr(dl, decNodes);
+    }
+
+    /* Sidebar: Verifications */
+    var vl = document.getElementById('verification-list');
+    var verifications = d.verifications || [];
+    if (verifications.length === 0) { clr(vl, el('div', { class: 'empty-hint' }, 'No verifications')); }
+    else {
+      clr(vl, verifications.map(function (v) {
+        return el('div', { class: 'ver-card' }, [
+          el('div', null, [
+            el('span', { class: 'ver-status ver-' + v.status }, v.status),
+            el('span', { class: 'ver-claim' }, v.claim),
+          ]),
+          el('div', { class: 'ver-meta' }, [
+            el('span', null, (nm[v.requester_id] || v.requester_id) + ' \u2192 ' + (nm[v.verifier_id] || v.verifier_id)),
+            el('span', null, fmt(v.created_at)),
+          ]),
+          v.response ? el('div', { class: 'ver-response' }, v.response) : null,
+        ]);
+      }));
+    }
+
+    /* Sidebar: Proposals */
+    var prl = document.getElementById('proposal-list');
+    var proposals = d.proposals || [];
+    if (proposals.length === 0) { clr(prl, el('div', { class: 'empty-hint' }, 'No proposals')); }
+    else {
+      clr(prl, proposals.map(function (p) {
+        var votes = p.votes || [];
+        var approves = votes.filter(function (v) { return v.vote === 'approve'; }).length;
+        var rejects = votes.filter(function (v) { return v.vote === 'reject'; }).length;
+        var pct = p.required_votes > 0 ? Math.min(100, Math.round((approves / p.required_votes) * 100)) : 0;
+        var statusLabel = p.status === 'open' ? '\u23F3 Open' : p.status === 'approved' ? '\u2705 Approved' : '\u274C Rejected';
+        var voteButtons = [];
+        if (p.status === 'open') {
+          var appBtn = el('button', { class: 'prop-vote-btn prop-approve' }, '\u2705 Approve');
+          appBtn.addEventListener('click', (function (pid) { return function () {
+            fetch('/vote-proposal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ proposal_id: pid, voter_id: 'dashboard', vote: 'approve', reason: '' }) }).catch(function () {});
+          }; })(p.id));
+          var rejBtn = el('button', { class: 'prop-vote-btn prop-reject' }, '\u274C Reject');
+          rejBtn.addEventListener('click', (function (pid) { return function () {
+            fetch('/vote-proposal', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ proposal_id: pid, voter_id: 'dashboard', vote: 'reject', reason: '' }) }).catch(function () {});
+          }; })(p.id));
+          voteButtons = [appBtn, rejBtn];
+        }
+        return el('div', { class: 'prop-card' }, [
+          el('div', null, [el('span', { class: 'prop-title' }, p.title), el('span', { class: 'prop-status' }, statusLabel)]),
+          p.description ? el('div', { class: 'prop-desc' }, p.description) : null,
+          el('div', { class: 'prop-votes' }, [document.createTextNode(approves + '/' + p.required_votes + ' approvals, ' + rejects + ' rejections')]),
+          el('div', { class: 'prop-bar' }, [el('div', { class: 'prop-bar-fill', style: 'width:' + pct + '%;background:var(--success)' })]),
+          voteButtons.length > 0 ? el('div', { class: 'prop-actions' }, voteButtons) : null,
+          votes.length > 0 ? el('div', { class: 'prop-voter-list' }, votes.map(function (v) {
+            return el('div', { class: 'prop-voter' }, [
+              el('span', null, v.vote === 'approve' ? '\u2705' : '\u274C'),
+              el('span', null, v.voter_name || v.voter_id),
+              v.reason ? el('span', { class: 'prop-voter-reason' }, v.reason) : null,
+            ]);
+          })) : null,
+        ]);
+      }));
+    }
+
     /* Pinned messages bar */
     var pinnedBar = document.getElementById('pinned-bar');
     if (pinnedMsgs.length === 0) { pinnedBar.style.display = 'none'; }
@@ -613,9 +711,6 @@ function render(d) {
       clr(pinnedBar, pinnedNodes);
     }
 
-    /* Name map */
-    var nm = {}; d.peers.forEach(function (p) { nm[p.id] = p.name || p.id; });
-    nm['dashboard'] = 'You'; nm['cli'] = 'CLI';
 
     /* Chat */
     var chat = document.getElementById('chat');
@@ -624,8 +719,8 @@ function render(d) {
         el('div', { class: 'ec-icon' }, [el('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, [
           el('path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }),
         ])]),
-        el('div', { class: 'ec-title' }, 'No messages yet'),
-        el('div', { class: 'ec-sub' }, 'Start a conversation below'),
+        el('div', { class: 'ec-title' }, 'Your peer network'),
+        el('div', { class: 'ec-sub' }, 'Structured messaging between Claude Code instances with verification, decisions, and consensus.'),
       ]));
       return;
     }
@@ -649,7 +744,34 @@ function render(d) {
       else { stTxt = '\u25CB'; stCls = 'st st-p'; }
       var bubCls = fromIsUser ? 'bub b-u' : fromIsCli ? 'bub b-s' : 'bub b-p';
       var footCls = fromIsUser ? 'bub-foot right' : 'bub-foot';
-      var textEl = renderMarkdown(m.text);
+      var textEl;
+      if (m.msg_type) {
+        var typeLabels = { question: 'Question', decision: 'Decision', context_share: 'Context', review_request: 'Review', handoff: 'Handoff' };
+        var badge = el('span', { class: 'msg-type-badge msg-type-' + m.msg_type }, typeLabels[m.msg_type] || m.msg_type);
+        var bodyEl = renderMarkdown(m.text);
+        while (bodyEl.firstChild && bodyEl.firstChild.className === 'bub-text') { bodyEl = bodyEl.firstChild; break; }
+        textEl = el('div', { class: 'bub-text' }, [badge]);
+        while (bodyEl.firstChild) textEl.appendChild(bodyEl.firstChild);
+      } else {
+        textEl = renderMarkdown(m.text);
+      }
+      if (m.context_snapshot) {
+        try {
+          var ctx = JSON.parse(m.context_snapshot);
+          var ctxToggle = el('div', { class: 'ctx-snap-toggle' }, '\u25B6 Context');
+          var ctxParts = [];
+          if (ctx.branch) ctxParts.push(el('div', null, 'Branch: ' + ctx.branch));
+          if (ctx.recent_files && ctx.recent_files.length > 0) ctxParts.push(el('div', null, 'Files: ' + ctx.recent_files.join(', ')));
+          if (ctx.summary) ctxParts.push(el('div', null, 'Summary: ' + ctx.summary));
+          var ctxBody = el('div', { class: 'ctx-snap-body' }, ctxParts);
+          ctxToggle.addEventListener('click', function () {
+            var b = this.nextSibling;
+            b.classList.toggle('open');
+            this.textContent = b.classList.contains('open') ? '\u25BC Context' : '\u25B6 Context';
+          });
+          textEl.appendChild(el('div', { class: 'ctx-snap' }, [ctxToggle, ctxBody]));
+        } catch (e) { /* ignore */ }
+      }
       if (isPeer(m.from_id)) { textEl.setAttribute('data-tr-src', m.text); textEl.setAttribute('data-msg-id', String(m.id)); }
       var footItems = [el('span', null, fmtSec(m.sent_at)), el('span', null, '\u2192 ' + toLabel), el('span', { class: stCls }, stTxt)];
       if (isPeer(m.from_id)) {

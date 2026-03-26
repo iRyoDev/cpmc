@@ -163,6 +163,78 @@ db.run(`
   )
 `);
 
+// --- Feature: structured messages + context snapshots ---
+try { db.run("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT NULL"); } catch { /* already exists */ }
+try { db.run("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL"); } catch { /* already exists */ }
+try { db.run("ALTER TABLE messages ADD COLUMN context_snapshot TEXT DEFAULT NULL"); } catch { /* already exists */ }
+
+// --- Feature: decisions board ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS decisions (
+    id TEXT PRIMARY KEY,
+    key TEXT NOT NULL UNIQUE,
+    value TEXT NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    author_id TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT '',
+    category TEXT NOT NULL DEFAULT 'general',
+    status TEXT NOT NULL DEFAULT 'active',
+    group_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    session_id TEXT NOT NULL DEFAULT ''
+  )
+`);
+
+// --- Feature: verification protocol ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS verifications (
+    id TEXT PRIMARY KEY,
+    requester_id TEXT NOT NULL,
+    verifier_id TEXT NOT NULL,
+    claim TEXT NOT NULL,
+    evidence_needed TEXT NOT NULL DEFAULT '',
+    files_to_check TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'pending',
+    response TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT '',
+    group_id TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    session_id TEXT NOT NULL DEFAULT ''
+  )
+`);
+
+// --- Feature: consensus protocol ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY,
+    author_id TEXT NOT NULL,
+    author_name TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    required_votes INTEGER NOT NULL DEFAULT 2,
+    status TEXT NOT NULL DEFAULT 'open',
+    group_id TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    session_id TEXT NOT NULL DEFAULT ''
+  )
+`);
+db.run(`
+  CREATE TABLE IF NOT EXISTS proposal_votes (
+    id TEXT PRIMARY KEY,
+    proposal_id TEXT NOT NULL,
+    voter_id TEXT NOT NULL,
+    voter_name TEXT NOT NULL DEFAULT '',
+    vote TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    UNIQUE(proposal_id, voter_id),
+    FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+  )
+`);
+
 // --- Feature: active files (edit conflict detection) ---
 // Stored in-memory for performance (files change frequently)
 // Map<peer_id, { files: string[], updated_at: number }>
@@ -176,6 +248,11 @@ db.run("CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id)");
 db.run("CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks(group_id)");
 db.run("CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_decisions_session ON decisions(session_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_decisions_category ON decisions(category)");
+db.run("CREATE INDEX IF NOT EXISTS idx_verifications_session ON verifications(session_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_proposals_session ON proposals(session_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_proposal_votes_proposal ON proposal_votes(proposal_id)");
 
 // --- Audit log helper ---
 function audit(action: string, actorId: string, details: string = "", groupId: string | null = null) {
@@ -325,6 +402,16 @@ const selectPeersByGitRoot = db.prepare(`
 const insertMessage = db.prepare(`
   INSERT INTO messages (from_id, to_id, text, sent_at, delivered, session_id)
   VALUES (?, ?, ?, ?, 0, ?)
+`);
+
+const insertMessageWithContext = db.prepare(`
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, session_id, context_snapshot)
+  VALUES (?, ?, ?, ?, 0, ?, ?)
+`);
+
+const insertStructuredMessage = db.prepare(`
+  INSERT INTO messages (from_id, to_id, text, sent_at, delivered, session_id, msg_type, metadata, context_snapshot)
+  VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
 `);
 
 const selectUndelivered = db.prepare(`
@@ -730,7 +817,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   });
 }
 
-function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
+function handleSendMessage(body: SendMessageRequest & { context_snapshot?: string }): { ok: boolean; error?: string } {
   // Rate limit per sender
   if (isRateLimited(body.from_id)) {
     return { ok: false, error: `Rate limited: max ${RATE_LIMIT_MAX} messages per minute` };
@@ -760,7 +847,12 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     }
   }
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString(), currentSessionId);
+  const now = new Date().toISOString();
+  if (body.context_snapshot) {
+    insertMessageWithContext.run(body.from_id, body.to_id, body.text, now, currentSessionId, body.context_snapshot);
+  } else {
+    insertMessage.run(body.from_id, body.to_id, body.text, now, currentSessionId);
+  }
   return { ok: true };
 }
 
@@ -1145,6 +1237,292 @@ function handleListApprovals(body: { peer_id?: string; status?: string }): { app
   return { approvals: db.query(query).all(...params) as any[] };
 }
 
+// --- Feature: Structured Messages ---
+
+const STRUCTURED_MSG_TYPES = ["question", "decision", "context_share", "review_request", "handoff"];
+
+function buildStructuredText(msgType: string, meta: any): string {
+  switch (msgType) {
+    case "question":
+      return `**Question:** ${meta.question}\n**Expected format:** ${meta.expected_format}${meta.context ? `\n**Context:** ${meta.context}` : ""}`;
+    case "decision":
+      return `**Decision:** ${meta.decision}\n**Rationale:** ${meta.rationale}${meta.alternatives_rejected?.length ? `\n**Rejected:** ${meta.alternatives_rejected.join(", ")}` : ""}`;
+    case "context_share":
+      return `**Context Update:** ${meta.summary}${meta.files_changed?.length ? `\n**Files:** ${meta.files_changed.join(", ")}` : ""}${meta.constraints?.length ? `\n**Constraints:** ${meta.constraints.join(", ")}` : ""}${meta.current_task ? `\n**Task:** ${meta.current_task}` : ""}`;
+    case "review_request":
+      return `**Review Request:** \`${meta.file_path}\`\n${meta.description}${meta.acceptance_criteria ? `\n**Criteria:** ${meta.acceptance_criteria}` : ""}`;
+    case "handoff":
+      return `**Handoff**\n**Completed:** ${meta.work_completed}\n**Remaining:** ${meta.remaining_work}\n**Files:** ${meta.files_modified.join(", ")}\n**Decisions:** ${meta.decisions_made.join(", ")}${meta.blockers?.length ? `\n**Blockers:** ${meta.blockers.join(", ")}` : ""}`;
+    default:
+      return meta.text || JSON.stringify(meta);
+  }
+}
+
+function handleSendStructured(body: any): { ok: boolean; error?: string } {
+  const fromId = body.from_id;
+  const toId = body.to_id;
+  const msgType = body.msg_type;
+
+  if (!fromId || !toId || !msgType) return { ok: false, error: "Missing from_id, to_id, or msg_type" };
+  if (!STRUCTURED_MSG_TYPES.includes(msgType)) return { ok: false, error: `Invalid msg_type. Use: ${STRUCTURED_MSG_TYPES.join(", ")}` };
+
+  // Validate type-specific required fields
+  switch (msgType) {
+    case "question":
+      if (!body.question || !body.expected_format) return { ok: false, error: "question type requires: question, expected_format" };
+      break;
+    case "decision":
+      if (!body.decision || !body.rationale) return { ok: false, error: "decision type requires: decision, rationale" };
+      break;
+    case "context_share":
+      if (!body.summary) return { ok: false, error: "context_share type requires: summary" };
+      break;
+    case "review_request":
+      if (!body.file_path || !body.description) return { ok: false, error: "review_request type requires: file_path, description" };
+      break;
+    case "handoff":
+      if (!body.work_completed || !body.remaining_work || !body.files_modified || !body.decisions_made)
+        return { ok: false, error: "handoff type requires: work_completed, remaining_work, files_modified, decisions_made" };
+      break;
+  }
+
+  // Check target exists
+  if (!VIRTUAL_PEERS.has(toId)) {
+    const target = db.query("SELECT id FROM peers WHERE id = ?").get(toId);
+    if (!target) return { ok: false, error: "Target peer not found" };
+  }
+
+  // Group isolation check
+  if (!VIRTUAL_PEERS.has(fromId) && !VIRTUAL_PEERS.has(toId) && !canCommunicate(fromId, toId)) {
+    return { ok: false, error: "Cannot send to peers in a different group" };
+  }
+
+  // Build metadata and human-readable text
+  const { from_id, to_id, msg_type: _, context_snapshot, ...metaFields } = body;
+  const metadata = JSON.stringify(metaFields);
+  const text = buildStructuredText(msgType, metaFields);
+
+  if (text.length > 65536) return { ok: false, error: "Message too long (max 64KB)" };
+
+  const now = new Date().toISOString();
+  insertStructuredMessage.run(fromId, toId, text, now, currentSessionId, msgType, metadata, context_snapshot || null);
+  audit("message.structured", fromId, `${msgType} → ${toId}`, getPeerGroupId(fromId) ?? null);
+  return { ok: true };
+}
+
+// --- Feature: Decisions Board ---
+
+function handlePostDecision(body: { author_id: string; key: string; value: string; rationale: string; category?: string }): { ok: boolean; id?: string; error?: string } {
+  const key = (body.key || "").trim();
+  const value = (body.value || "").trim();
+  const rationale = (body.rationale || "").trim();
+  if (!key || !value) return { ok: false, error: "key and value are required" };
+  if (key.length > 100) return { ok: false, error: "Key too long (max 100)" };
+  if (value.length > 2000) return { ok: false, error: "Value too long (max 2000)" };
+
+  const category = (body.category || "general").trim();
+  const authorId = body.author_id;
+  const actorRow = db.query("SELECT name FROM peers WHERE id = ?").get(authorId) as { name: string } | null;
+  const authorName = actorRow?.name || (VIRTUAL_PEERS.has(authorId) ? authorId : "");
+  const groupId = VIRTUAL_PEERS.has(authorId) ? null : (getPeerGroupId(authorId) ?? null);
+  const now = new Date().toISOString();
+
+  // Upsert: update if key exists, insert otherwise
+  const existing = db.query("SELECT id FROM decisions WHERE key = ?").get(key) as { id: string } | null;
+  let id: string;
+  if (existing) {
+    id = existing.id;
+    db.run("UPDATE decisions SET value = ?, rationale = ?, author_id = ?, author_name = ?, category = ?, status = 'active', group_id = ?, updated_at = ?, session_id = ? WHERE id = ?",
+      [value, rationale, authorId, authorName, category, groupId, now, currentSessionId, id]);
+  } else {
+    id = generateId();
+    db.run("INSERT INTO decisions (id, key, value, rationale, author_id, author_name, category, status, group_id, created_at, updated_at, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+      [id, key, value, rationale, authorId, authorName, category, groupId, now, now, currentSessionId]);
+  }
+
+  audit("decision.post", authorId, `[${category}] ${key} = ${value}`, groupId);
+
+  // Notify group peers
+  if (groupId) {
+    const groupPeers = db.query("SELECT id FROM peers WHERE group_id = ? AND id != ?").all(groupId, authorId) as { id: string }[];
+    for (const p of groupPeers) {
+      insertMessage.run(authorId, p.id, `**Decision posted** [${category}]: **${key}** = ${value}\n*Rationale:* ${rationale}`, now, currentSessionId);
+    }
+  }
+
+  return { ok: true, id };
+}
+
+function handleListDecisions(body: { key?: string; category?: string; status?: string }): { decisions: any[] } {
+  let query = "SELECT * FROM decisions WHERE session_id = ?";
+  const params: any[] = [currentSessionId];
+  if (body.key) { query += " AND key = ?"; params.push(body.key); }
+  if (body.category) { query += " AND category = ?"; params.push(body.category); }
+  if (body.status) { query += " AND status = ?"; params.push(body.status); }
+  else { query += " AND status = 'active'"; }
+  query += " ORDER BY updated_at DESC LIMIT 50";
+  return { decisions: db.query(query).all(...params) as any[] };
+}
+
+function handleRevokeDecision(body: { decision_id: string; peer_id: string }): { ok: boolean; error?: string } {
+  const dec = db.query("SELECT * FROM decisions WHERE id = ?").get(body.decision_id) as any;
+  if (!dec) return { ok: false, error: "Decision not found" };
+  db.run("UPDATE decisions SET status = 'revoked', updated_at = ? WHERE id = ?", [new Date().toISOString(), body.decision_id]);
+  audit("decision.revoke", body.peer_id, `Revoked: ${dec.key}`, dec.group_id);
+  return { ok: true };
+}
+
+// --- Feature: Verification Protocol ---
+
+function handleRequestVerification(body: { requester_id: string; verifier_id: string; claim: string; evidence_needed: string; files_to_check?: string[] }): { ok: boolean; id?: string; error?: string } {
+  const claim = (body.claim || "").trim();
+  const evidenceNeeded = (body.evidence_needed || "").trim();
+  if (!claim) return { ok: false, error: "claim is required" };
+  if (!body.requester_id || !body.verifier_id) return { ok: false, error: "requester_id and verifier_id are required" };
+
+  if (!VIRTUAL_PEERS.has(body.verifier_id)) {
+    const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.verifier_id);
+    if (!target) return { ok: false, error: "Verifier not found" };
+  }
+
+  if (!VIRTUAL_PEERS.has(body.requester_id) && !VIRTUAL_PEERS.has(body.verifier_id) && !canCommunicate(body.requester_id, body.verifier_id)) {
+    return { ok: false, error: "Cannot request verification from peers in a different group" };
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  const groupId = VIRTUAL_PEERS.has(body.requester_id) ? null : (getPeerGroupId(body.requester_id) ?? null);
+  const filesJson = JSON.stringify(body.files_to_check || []);
+
+  db.run("INSERT INTO verifications (id, requester_id, verifier_id, claim, evidence_needed, files_to_check, status, group_id, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+    [id, body.requester_id, body.verifier_id, claim, evidenceNeeded, filesJson, groupId, now, currentSessionId]);
+
+  // Notify verifier
+  const requesterName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.requester_id) as any)?.name || body.requester_id;
+  const filesStr = (body.files_to_check || []).length > 0 ? `\n**Files to check:** ${(body.files_to_check || []).join(", ")}` : "";
+  insertMessage.run(body.requester_id, body.verifier_id,
+    `**Verification requested**\n**Claim:** ${claim}\n**Evidence needed:** ${evidenceNeeded}${filesStr}\n\nVerification ID: \`${id}\`\nUse \`respond_verification\` with status verified/failed.`,
+    now, currentSessionId);
+
+  audit("verification.request", body.requester_id, claim, groupId);
+  return { ok: true, id };
+}
+
+function handleRespondVerification(body: { verification_id: string; verifier_id: string; status: string; response: string; evidence?: string }): { ok: boolean; error?: string } {
+  const ver = db.query("SELECT * FROM verifications WHERE id = ?").get(body.verification_id) as any;
+  if (!ver) return { ok: false, error: "Verification not found" };
+  if (ver.status !== "pending") return { ok: false, error: "Verification already resolved" };
+  if (ver.verifier_id !== body.verifier_id && !VIRTUAL_PEERS.has(body.verifier_id)) return { ok: false, error: "Only the designated verifier can respond" };
+  if (body.status !== "verified" && body.status !== "failed") return { ok: false, error: "Status must be verified or failed" };
+
+  const now = new Date().toISOString();
+  db.run("UPDATE verifications SET status = ?, response = ?, evidence = ?, resolved_at = ? WHERE id = ?",
+    [body.status, body.response || "", body.evidence || "", now, body.verification_id]);
+
+  // Notify requester
+  const emoji = body.status === "verified" ? "✅" : "❌";
+  const verifierName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.verifier_id) as any)?.name || body.verifier_id;
+  insertMessage.run(body.verifier_id, ver.requester_id,
+    `${emoji} **Verification ${body.status}**\n**Claim:** ${ver.claim}\n**Response:** ${body.response}${body.evidence ? `\n**Evidence:** ${body.evidence}` : ""}`,
+    now, currentSessionId);
+
+  audit(`verification.${body.status}`, body.verifier_id, ver.claim, ver.group_id);
+  return { ok: true };
+}
+
+function handleListVerifications(body: { peer_id?: string; status?: string }): { verifications: any[] } {
+  let query = "SELECT * FROM verifications WHERE session_id = ?";
+  const params: any[] = [currentSessionId];
+  if (body.peer_id) { query += " AND (requester_id = ? OR verifier_id = ?)"; params.push(body.peer_id, body.peer_id); }
+  if (body.status) { query += " AND status = ?"; params.push(body.status); }
+  query += " ORDER BY created_at DESC LIMIT 30";
+  return { verifications: db.query(query).all(...params) as any[] };
+}
+
+// --- Feature: Consensus Protocol ---
+
+function handleCreateProposal(body: { author_id: string; title: string; description?: string; required_votes?: number }): { ok: boolean; id?: string; error?: string } {
+  const title = (body.title || "").trim();
+  if (!title) return { ok: false, error: "title is required" };
+  if (title.length > 200) return { ok: false, error: "Title too long (max 200)" };
+
+  const requiredVotes = body.required_votes || 2;
+  if (requiredVotes < 1 || requiredVotes > 20) return { ok: false, error: "required_votes must be 1-20" };
+
+  const authorId = body.author_id;
+  const actorRow = db.query("SELECT name FROM peers WHERE id = ?").get(authorId) as { name: string } | null;
+  const authorName = actorRow?.name || (VIRTUAL_PEERS.has(authorId) ? authorId : "");
+  const groupId = VIRTUAL_PEERS.has(authorId) ? null : (getPeerGroupId(authorId) ?? null);
+  const id = generateId();
+  const now = new Date().toISOString();
+
+  db.run("INSERT INTO proposals (id, author_id, author_name, title, description, required_votes, status, group_id, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)",
+    [id, authorId, authorName, title, body.description || "", requiredVotes, groupId, now, currentSessionId]);
+
+  // Broadcast to group peers
+  const peers = groupId
+    ? db.query("SELECT id FROM peers WHERE group_id = ? AND id != ?").all(groupId, authorId) as { id: string }[]
+    : db.query("SELECT id FROM peers WHERE id != ?").all(authorId) as { id: string }[];
+
+  for (const p of peers) {
+    insertMessage.run(authorId, p.id,
+      `**Proposal:** ${title}${body.description ? `\n${body.description}` : ""}\n\nVotes needed: ${requiredVotes}\nProposal ID: \`${id}\`\nUse \`vote_proposal\` to approve or reject.`,
+      now, currentSessionId);
+  }
+
+  audit("proposal.create", authorId, title, groupId);
+  return { ok: true, id };
+}
+
+function handleVoteProposal(body: { proposal_id: string; voter_id: string; vote: string; reason?: string }): { ok: boolean; status?: string; error?: string } {
+  const proposal = db.query("SELECT * FROM proposals WHERE id = ?").get(body.proposal_id) as any;
+  if (!proposal) return { ok: false, error: "Proposal not found" };
+  if (proposal.status !== "open") return { ok: false, error: "Proposal is no longer open" };
+  if (body.vote !== "approve" && body.vote !== "reject") return { ok: false, error: "Vote must be approve or reject" };
+  if (proposal.author_id === body.voter_id && !VIRTUAL_PEERS.has(body.voter_id)) return { ok: false, error: "Cannot vote on your own proposal" };
+
+  const voterRow = db.query("SELECT name FROM peers WHERE id = ?").get(body.voter_id) as { name: string } | null;
+  const voterName = voterRow?.name || (VIRTUAL_PEERS.has(body.voter_id) ? body.voter_id : "");
+  const now = new Date().toISOString();
+  const voteId = generateId();
+
+  // Upsert vote (replace if already voted)
+  db.run("INSERT OR REPLACE INTO proposal_votes (id, proposal_id, voter_id, voter_name, vote, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [voteId, body.proposal_id, body.voter_id, voterName, body.vote, body.reason || "", now]);
+
+  // Check for auto-resolve
+  const approves = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'approve'").get(body.proposal_id) as any).c;
+  const rejects = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'reject'").get(body.proposal_id) as any).c;
+
+  let newStatus = "open";
+  if (approves >= proposal.required_votes) {
+    newStatus = "approved";
+    db.run("UPDATE proposals SET status = 'approved', resolved_at = ? WHERE id = ?", [now, body.proposal_id]);
+    insertMessage.run(body.voter_id, proposal.author_id, `✅ **Proposal approved:** ${proposal.title}\n${approves} approvals, ${rejects} rejections`, now, currentSessionId);
+  } else if (rejects >= proposal.required_votes) {
+    newStatus = "rejected";
+    db.run("UPDATE proposals SET status = 'rejected', resolved_at = ? WHERE id = ?", [now, body.proposal_id]);
+    insertMessage.run(body.voter_id, proposal.author_id, `❌ **Proposal rejected:** ${proposal.title}\n${approves} approvals, ${rejects} rejections`, now, currentSessionId);
+  }
+
+  audit("proposal.vote", body.voter_id, `${body.vote} on "${proposal.title}"`, proposal.group_id);
+  return { ok: true, status: newStatus };
+}
+
+function handleListProposals(body: { status?: string }): { proposals: any[] } {
+  let query = "SELECT * FROM proposals WHERE session_id = ?";
+  const params: any[] = [currentSessionId];
+  if (body.status) { query += " AND status = ?"; params.push(body.status); }
+  query += " ORDER BY created_at DESC LIMIT 20";
+  const proposals = db.query(query).all(...params) as any[];
+  return {
+    proposals: proposals.map((p: any) => ({
+      ...p,
+      votes: db.query("SELECT * FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(p.id) as any[],
+    })),
+  };
+}
+
 // --- Feature: Session Report ---
 
 function handleSessionReport(): { report: string } {
@@ -1275,6 +1653,15 @@ function getDashboardState() {
   const msgIds = messages.map((m: Message) => m.id);
   const reactions = getReactionsForMessages(msgIds);
 
+  // New features: decisions, verifications, proposals
+  const decisions = db.query("SELECT * FROM decisions WHERE session_id = ? ORDER BY updated_at DESC LIMIT 50").all(currentSessionId) as any[];
+  const verifications = db.query("SELECT * FROM verifications WHERE session_id = ? ORDER BY created_at DESC LIMIT 30").all(currentSessionId) as any[];
+  const proposalsRaw = db.query("SELECT * FROM proposals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as any[];
+  const proposals = proposalsRaw.map((p: any) => ({
+    ...p,
+    votes: db.query("SELECT * FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(p.id) as any[],
+  }));
+
   return {
     peers,
     messages,
@@ -1286,6 +1673,9 @@ function getDashboardState() {
     approvals,
     audit: recentAudit,
     reactions,
+    decisions,
+    verifications,
+    proposals,
     session_id: currentSessionId,
     uptime_ms: Date.now() - BROKER_START_TIME,
   };
@@ -1472,6 +1862,35 @@ Bun.serve({
           const b = validateBody(body);
           return Response.json(handleGetAuditLog({ limit: typeof b.limit === "number" ? b.limit : undefined }));
         }
+
+        // --- Structured Messages ---
+        case "/send-structured":
+          return Response.json(handleSendStructured(body));
+
+        // --- Decisions Board ---
+        case "/post-decision":
+          return Response.json(handlePostDecision(body as any));
+        case "/list-decisions":
+          return Response.json(handleListDecisions(body as any || {}));
+        case "/revoke-decision":
+          return Response.json(handleRevokeDecision(body as any));
+
+        // --- Verification Protocol ---
+        case "/request-verification":
+          return Response.json(handleRequestVerification(body as any));
+        case "/respond-verification":
+          return Response.json(handleRespondVerification(body as any));
+        case "/list-verifications":
+          return Response.json(handleListVerifications(body as any || {}));
+
+        // --- Consensus Protocol ---
+        case "/create-proposal":
+          return Response.json(handleCreateProposal(body as any));
+        case "/vote-proposal":
+          return Response.json(handleVoteProposal(body as any));
+        case "/list-proposals":
+          return Response.json(handleListProposals(body as any || {}));
+
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

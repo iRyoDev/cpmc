@@ -28,6 +28,7 @@ import type {
   BroadcastResponse,
 } from "./shared/types.ts";
 import { createLogger } from "./shared/log.ts";
+import { getRecentFiles } from "./shared/summarize.ts";
 
 // --- Configuration ---
 
@@ -153,6 +154,13 @@ let myId: PeerId | null = null;
 let myName: string = "";
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+let mySummary: string = "";
+
+async function buildContextSnapshot(): Promise<string> {
+  const branch = await getGitBranch(myCwd);
+  const recentFiles = await getRecentFiles(myCwd, 5);
+  return JSON.stringify({ branch, recent_files: recentFiles, summary: mySummary, cwd: myCwd });
+}
 let consecutivePollFailures = 0;
 let reconnectPromise: Promise<void> | null = null;
 let isPolling = false;
@@ -460,6 +468,123 @@ const TOOLS = [
       properties: {},
     },
   },
+
+  // --- Structured Messages ---
+  {
+    name: "send_structured",
+    description: "Send a typed, structured message to another peer. Forces clarity by requiring specific fields based on message type. Types: question (ask with expected answer format), decision (record a choice with rationale), context_share (share current work context), review_request (request code review), handoff (transfer work).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: { type: "string" as const, description: "Peer name or ID" },
+        msg_type: { type: "string" as const, enum: ["question", "decision", "context_share", "review_request", "handoff"], description: "Message type" },
+        question: { type: "string" as const, description: "For question type: the question" },
+        expected_format: { type: "string" as const, description: "For question type: expected answer format" },
+        context: { type: "string" as const, description: "For question type: additional context" },
+        decision: { type: "string" as const, description: "For decision type: the decision made" },
+        rationale: { type: "string" as const, description: "For decision type: reasoning behind the decision" },
+        alternatives_rejected: { type: "array" as const, items: { type: "string" as const }, description: "For decision type: alternatives that were rejected" },
+        summary: { type: "string" as const, description: "For context_share type: summary of current work" },
+        files_changed: { type: "array" as const, items: { type: "string" as const }, description: "For context_share type: files changed" },
+        constraints: { type: "array" as const, items: { type: "string" as const }, description: "For context_share type: constraints to be aware of" },
+        current_task: { type: "string" as const, description: "For context_share type: current task" },
+        file_path: { type: "string" as const, description: "For review_request type: file to review" },
+        description: { type: "string" as const, description: "For review_request type: what to review" },
+        acceptance_criteria: { type: "string" as const, description: "For review_request type: acceptance criteria" },
+        work_completed: { type: "string" as const, description: "For handoff type: work completed" },
+        remaining_work: { type: "string" as const, description: "For handoff type: remaining work" },
+        files_modified: { type: "array" as const, items: { type: "string" as const }, description: "For handoff type: files modified" },
+        decisions_made: { type: "array" as const, items: { type: "string" as const }, description: "For handoff type: decisions made" },
+        blockers: { type: "array" as const, items: { type: "string" as const }, description: "For handoff type: blockers" },
+      },
+      required: ["to_id", "msg_type"],
+    },
+  },
+
+  // --- Decisions Board ---
+  {
+    name: "post_decision",
+    description: "Record an architectural decision on the shared decisions board. Other peers in your group can query this to stay aligned. Decisions are keyed — posting the same key updates the existing decision.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        key: { type: "string" as const, description: "Decision key, e.g. 'auth_strategy', 'db_orm', 'api_format'" },
+        value: { type: "string" as const, description: "The decision value, e.g. 'JWT with refresh tokens'" },
+        rationale: { type: "string" as const, description: "Why this decision was made" },
+        category: { type: "string" as const, description: "Category for grouping, e.g. 'architecture', 'tooling', 'conventions'. Default: 'general'" },
+      },
+      required: ["key", "value", "rationale"],
+    },
+  },
+  {
+    name: "query_decisions",
+    description: "Query the shared decisions board. Returns all active decisions, optionally filtered by key or category. Always check decisions before making architectural choices.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        key: { type: "string" as const, description: "Optional: look up a specific decision key" },
+        category: { type: "string" as const, description: "Optional: filter by category" },
+      },
+    },
+  },
+
+  // --- Verification Protocol ---
+  {
+    name: "request_verification",
+    description: "Ask another peer to verify a specific claim. The verifier receives the claim, evidence requirements, and relevant files, and responds with verified/failed + proof. Use this before acting on assumptions.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: { type: "string" as const, description: "Peer name or ID of the verifier" },
+        claim: { type: "string" as const, description: "The specific claim to verify, e.g. 'function parseConfig in config.ts returns a Config object'" },
+        evidence_needed: { type: "string" as const, description: "What evidence would confirm or deny the claim" },
+        files_to_check: { type: "array" as const, items: { type: "string" as const }, description: "File paths the verifier should check" },
+      },
+      required: ["to_id", "claim", "evidence_needed"],
+    },
+  },
+  {
+    name: "respond_verification",
+    description: "Respond to a verification request with your findings.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        verification_id: { type: "string" as const, description: "The verification ID from the request" },
+        status: { type: "string" as const, enum: ["verified", "failed"], description: "Whether the claim was verified or failed" },
+        response: { type: "string" as const, description: "Your verification findings" },
+        evidence: { type: "string" as const, description: "Evidence supporting your response" },
+      },
+      required: ["verification_id", "status", "response"],
+    },
+  },
+
+  // --- Consensus Protocol ---
+  {
+    name: "create_proposal",
+    description: "Propose a decision that requires peer votes before being finalized. Broadcasts to all group peers. Auto-resolves when the vote threshold is reached.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        title: { type: "string" as const, description: "Proposal title" },
+        description: { type: "string" as const, description: "Detailed proposal description" },
+        required_votes: { type: "number" as const, description: "Number of approvals needed (default: 2, max: 20)" },
+      },
+      required: ["title", "description"],
+    },
+  },
+  {
+    name: "vote_proposal",
+    description: "Vote on an open proposal. Cannot vote on your own proposals.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        proposal_id: { type: "string" as const, description: "The proposal ID" },
+        vote: { type: "string" as const, enum: ["approve", "reject"], description: "Your vote" },
+        reason: { type: "string" as const, description: "Reason for your vote" },
+      },
+      required: ["proposal_id", "vote"],
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -542,10 +667,15 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const byName = peers.find((p) => p.name === to_id);
         if (byName) resolvedId = byName.id;
 
+        // Auto-attach context snapshot
+        let contextSnapshot: string | undefined;
+        try { contextSnapshot = await buildContextSnapshot(); } catch { /* non-critical */ }
+
         const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-message", {
           from_id: myId,
           to_id: resolvedId,
           text: message,
+          context_snapshot: contextSnapshot,
         });
         if (!result.ok) {
           return {
@@ -598,6 +728,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        mySummary = summary;
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -877,6 +1008,125 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       try {
         const result = await brokerFetch<{ report: string }>("/session-report", {});
         return { content: [{ type: "text" as const, text: result.report }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    // --- Structured Messages ---
+    case "send_structured": {
+      const { to_id, msg_type, ...fields } = args as any;
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        let resolvedId = to_id;
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+        const byName = peers.find((p: Peer) => p.name === to_id);
+        if (byName) resolvedId = byName.id;
+
+        let contextSnapshot: string | undefined;
+        try { contextSnapshot = await buildContextSnapshot(); } catch { /* non-critical */ }
+
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/send-structured", {
+          from_id: myId, to_id: resolvedId, msg_type, context_snapshot: contextSnapshot, ...fields,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        const label = byName ? byName.name : resolvedId;
+        return { content: [{ type: "text" as const, text: `Structured ${msg_type} sent to ${label}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    // --- Decisions Board ---
+    case "post_decision": {
+      const { key, value, rationale, category } = args as { key: string; value: string; rationale: string; category?: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; id?: string; error?: string }>("/post-decision", {
+          author_id: myId, key, value, rationale, category,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Decision posted: [${category || "general"}] ${key} = ${value}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "query_decisions": {
+      const { key, category } = (args || {}) as { key?: string; category?: string };
+      try {
+        const result = await brokerFetch<{ decisions: any[] }>("/list-decisions", { key, category });
+        if (result.decisions.length === 0) {
+          return { content: [{ type: "text" as const, text: key ? `No decision found for key "${key}"` : "No decisions recorded yet." }] };
+        }
+        const lines = result.decisions.map((d: any) =>
+          `[${d.category}] **${d.key}** = ${d.value}\n  Rationale: ${d.rationale}\n  By: ${d.author_name || d.author_id} (${d.updated_at})`
+        );
+        return { content: [{ type: "text" as const, text: `Decisions:\n\n${lines.join("\n\n")}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    // --- Verification Protocol ---
+    case "request_verification": {
+      const { to_id, claim, evidence_needed, files_to_check } = args as any;
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        let resolvedId = to_id;
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+        const byName = peers.find((p: Peer) => p.name === to_id);
+        if (byName) resolvedId = byName.id;
+
+        const result = await brokerFetch<{ ok: boolean; id?: string; error?: string }>("/request-verification", {
+          requester_id: myId, verifier_id: resolvedId, claim, evidence_needed, files_to_check,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Verification requested (ID: ${result.id}). Waiting for ${byName?.name || resolvedId} to respond.` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "respond_verification": {
+      const { verification_id, status, response, evidence } = args as any;
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/respond-verification", {
+          verification_id, verifier_id: myId, status, response, evidence,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Verification ${status}. Response sent to requester.` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    // --- Consensus Protocol ---
+    case "create_proposal": {
+      const { title, description, required_votes } = args as any;
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; id?: string; error?: string }>("/create-proposal", {
+          author_id: myId, title, description, required_votes,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Proposal created (ID: ${result.id}): "${title}"\nBroadcast to group peers. Needs ${required_votes || 2} votes.` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "vote_proposal": {
+      const { proposal_id, vote, reason } = args as any;
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; status?: string; error?: string }>("/vote-proposal", {
+          proposal_id, voter_id: myId, vote, reason,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        const statusMsg = result.status === "approved" ? " — APPROVED!" : result.status === "rejected" ? " — REJECTED" : " — still open";
+        return { content: [{ type: "text" as const, text: `Vote cast: ${vote}${reason ? ` (${reason})` : ""}${statusMsg}` }] };
       } catch (e) {
         return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
       }
