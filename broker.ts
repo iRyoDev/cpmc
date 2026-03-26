@@ -256,7 +256,7 @@ function getAlivePids(pidsToCheck: number[]): Set<number> {
         // CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
         const match = line.match(/^"[^"]*","(\d+)"/);
         if (match) {
-          const pid = parseInt(match[1], 10);
+          const pid = parseInt(match[1]!, 10);
           if (checkSet.has(pid)) alive.add(pid);
         }
       }
@@ -1090,7 +1090,7 @@ function getReactionsForMessages(messageIds: number[]): Record<number, Array<{ e
   const result: Record<number, any[]> = {};
   for (const row of rows) {
     if (!result[row.message_id]) result[row.message_id] = [];
-    result[row.message_id].push({ emoji: row.emoji, peer_id: row.peer_id, peer_name: row.peer_name });
+    result[row.message_id]!.push({ emoji: row.emoji, peer_id: row.peer_id, peer_name: row.peer_name });
   }
   return result;
 }
@@ -1162,7 +1162,7 @@ function handleSessionReport(): { report: string } {
   // Gather active files
   const af = getActiveFilesState();
 
-  const sessionStart = messages.length > 0 ? messages[0].sent_at : new Date().toISOString();
+  const sessionStart = messages.length > 0 ? messages[0]!.sent_at : new Date().toISOString();
   const duration = messages.length > 0 ? Math.round((Date.now() - new Date(sessionStart).getTime()) / 60000) : 0;
 
   let md = `# Session Report\n\n`;
