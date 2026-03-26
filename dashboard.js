@@ -447,9 +447,13 @@ function render(d) {
             body: JSON.stringify({ peer_id: p.id, group_id: gid })
           }).catch(function () { });
         });
+        var avatar = el('div', { class: 'p-avatar' }, [
+          document.createTextNode(ini(p.name || p.id)),
+          el('span', { class: 'status-ring ' + sc(p.last_seen) }),
+        ]);
         return el('div', { class: 'p-card' }, [
           el('div', { class: 'p-row' }, [
-            el('div', { class: 'p-dot ' + sc(p.last_seen) }),
+            avatar,
             el('div', { class: 'p-name' }, p.name || p.id),
             el('span', { class: statusCls }, p.status || 'online'),
             copyBtn,
@@ -755,21 +759,40 @@ function connectWS() {
   var pill = document.getElementById('ws-pill');
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
-  ws.onopen = function () { pill.textContent = 'connected'; pill.className = 'nav-pill ok'; wsRetry = 1000; };
+  ws.onopen = function () { pill.textContent = ''; pill.appendChild(el('span', { class: 'conn-dot' })); pill.appendChild(document.createTextNode(' connected')); pill.className = 'conn-badge ok'; wsRetry = 1000; };
   ws.onmessage = function (ev) { try { render(JSON.parse(ev.data)); } catch (e) { console.error('WS parse error:', e); } };
   ws.onclose = function () {
-    pill.textContent = 'reconnecting'; pill.className = 'nav-pill err';
+    pill.textContent = ''; pill.appendChild(el('span', { class: 'conn-dot' })); pill.appendChild(document.createTextNode(' reconnecting')); pill.className = 'conn-badge err';
     setTimeout(connectWS, wsRetry); wsRetry = Math.min(wsRetry * 1.5, 10000);
   };
   ws.onerror = function () { ws.close(); };
 }
 
 /* ═══ Send ═══ */
+function resetSendBtn(btn) {
+  while (btn.firstChild) btn.removeChild(btn.firstChild);
+  var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  var line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+  line.setAttribute('x1', '12'); line.setAttribute('y1', '19');
+  line.setAttribute('x2', '12'); line.setAttribute('y2', '5');
+  var poly = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+  poly.setAttribute('points', '5 12 12 5 19 12');
+  svg.appendChild(line); svg.appendChild(poly);
+  btn.appendChild(svg);
+}
 async function sendMsg() {
   var to = document.getElementById('to-peer').value;
-  var text = document.getElementById('msg-text').value.trim();
+  var textarea = document.getElementById('msg-text');
+  var text = textarea.value.trim();
   if (!to || !text) return;
   var btn = document.getElementById('send-btn');
+  while (btn.firstChild) btn.removeChild(btn.firstChild);
   btn.textContent = '\u2022\u2022\u2022';
   try {
     var r = await fetch('/send-message', {
@@ -778,37 +801,69 @@ async function sendMsg() {
     });
     var d = await r.json();
     var t = document.getElementById('toast');
-    if (d.ok) { t.textContent = '\u2713 Sent'; t.style.color = 'var(--grn)'; document.getElementById('msg-text').value = ''; shouldScroll = true; }
-    else { t.textContent = '\u2717 ' + d.error; t.style.color = 'var(--red)'; }
+    if (d.ok) { t.textContent = '\u2713 Sent'; t.style.color = 'var(--success)'; textarea.value = ''; textarea.style.height = 'auto'; shouldScroll = true; }
+    else { t.textContent = '\u2717 ' + d.error; t.style.color = 'var(--error)'; }
     setTimeout(function () { t.textContent = ''; }, 2500);
   } catch (e) { document.getElementById('toast').textContent = '\u2717 ' + e.message; }
-  finally { btn.textContent = 'Send'; }
+  finally { resetSendBtn(btn); }
 }
 document.getElementById('send-btn').addEventListener('click', sendMsg);
 document.getElementById('msg-text').addEventListener('keydown', function (e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMsg(); }
 });
 
-/* ═══ Sidebar toggle ═══ */
-document.getElementById('sidebar-toggle').addEventListener('click', function () {
-  document.getElementById('sidebar').classList.toggle('open');
-  var ov = document.getElementById('sidebar-overlay');
-  ov.classList.toggle('show');
-  ov.style.display = ov.classList.contains('show') ? 'block' : 'none';
-});
-document.getElementById('sidebar-overlay').addEventListener('click', function () {
-  document.getElementById('sidebar').classList.remove('open');
-  this.classList.remove('show'); this.style.display = 'none';
-});
+/* ═══ Sidebar toggle & panel switching ═══ */
+(function () {
+  var app = document.querySelector('.app');
+  var sidebar = document.getElementById('sidebar');
+  var savedState = localStorage.getItem('sidebar-state') || 'expanded';
+  app.setAttribute('data-sidebar', savedState);
+
+  /* Mobile hamburger */
+  document.getElementById('sidebar-trigger').addEventListener('click', function () {
+    sidebar.classList.toggle('open');
+    var ov = document.getElementById('sidebar-overlay');
+    ov.classList.toggle('show');
+  });
+  document.getElementById('sidebar-overlay').addEventListener('click', function () {
+    sidebar.classList.remove('open');
+    this.classList.remove('show');
+  });
+
+  /* Rail item clicks — switch panel + expand sidebar */
+  var railItems = document.querySelectorAll('.rail-item');
+  railItems.forEach(function (item) {
+    item.addEventListener('click', function () {
+      var panel = this.getAttribute('data-panel');
+      /* If clicking the already-active rail item, toggle sidebar collapse */
+      if (this.classList.contains('active') && app.getAttribute('data-sidebar') === 'expanded') {
+        app.setAttribute('data-sidebar', 'collapsed');
+        localStorage.setItem('sidebar-state', 'collapsed');
+        return;
+      }
+      /* Expand sidebar if collapsed */
+      if (app.getAttribute('data-sidebar') === 'collapsed') {
+        app.setAttribute('data-sidebar', 'expanded');
+        localStorage.setItem('sidebar-state', 'expanded');
+      }
+      /* Switch active panel */
+      document.querySelectorAll('.panel-content').forEach(function (p) { p.classList.remove('active'); });
+      var target = document.getElementById('panel-' + panel);
+      if (target) target.classList.add('active');
+      railItems.forEach(function (r) { r.classList.remove('active'); });
+      this.classList.add('active');
+    });
+  });
+})();
 
 /* ═══ Theme toggle ═══ */
 var savedTheme = localStorage.getItem('theme') || 'dark';
-document.documentElement.setAttribute('data-theme', savedTheme === 'light' ? 'light' : '');
+document.documentElement.setAttribute('data-theme', savedTheme);
 document.getElementById('theme-btn').addEventListener('click', function () {
   var current = document.documentElement.getAttribute('data-theme');
-  var next = current === 'light' ? '' : 'light';
+  var next = current === 'light' ? 'dark' : 'light';
   document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('theme', next === 'light' ? 'light' : 'dark');
+  localStorage.setItem('theme', next);
 });
 
 /* ═══ Search ═══ */
@@ -843,7 +898,7 @@ document.getElementById('g-create-btn').addEventListener('click', function () {
       if (d.ok) { document.getElementById('g-join-name').value = ''; }
       else {
         var t = document.getElementById('toast');
-        t.textContent = '\u2717 ' + (d.error || 'Failed'); t.style.color = 'var(--red)';
+        t.textContent = '\u2717 ' + (d.error || 'Failed'); t.style.color = 'var(--error)';
         setTimeout(function () { t.textContent = ''; }, 3000);
       }
     }).catch(function () { });
@@ -853,7 +908,7 @@ document.getElementById('g-create-btn').addEventListener('click', function () {
 function copyId(id) {
   navigator.clipboard.writeText(id).then(function () {
     var t = document.getElementById('toast');
-    t.textContent = 'Copied: ' + id; t.style.color = 'var(--accent)';
+    t.textContent = 'Copied: ' + id; t.style.color = 'var(--text-secondary)';
     setTimeout(function () { t.textContent = ''; }, 1500);
   }).catch(function () { });
 }
@@ -874,8 +929,12 @@ document.getElementById('export-btn').addEventListener('click', function () {
   URL.revokeObjectURL(url);
 });
 
-/* ═══ Char counter ═══ */
+/* ═══ Textarea auto-resize & char counter ═══ */
 document.getElementById('msg-text').addEventListener('input', function () {
+  /* Auto-resize */
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+  /* Char counter */
   var len = this.value.length;
   var counter = document.getElementById('char-counter');
   if (len > 50000) {
@@ -890,7 +949,7 @@ sendMsg = async function () {
   var text = document.getElementById('msg-text').value.trim();
   if (text.length > 65536) {
     var t = document.getElementById('toast');
-    t.textContent = '\u2717 Message too long (max 64KB)'; t.style.color = 'var(--red)';
+    t.textContent = '\u2717 Message too long (max 64KB)'; t.style.color = 'var(--error)';
     setTimeout(function () { t.textContent = ''; }, 3000);
     return;
   }
