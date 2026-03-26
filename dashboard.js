@@ -269,6 +269,101 @@ async function translateBubble(msgId, rawText, btn, textEl) {
   finally { btn.classList.remove('loading'); }
 }
 
+/* ═══ Command Palette ═══ */
+var cmdOpen = false;
+var cmdActions = [
+  { icon: '\u{1F4E4}', label: 'Export Chat', desc: 'Ctrl+Shift+E', fn: function () { document.getElementById('export-btn').click(); } },
+  { icon: '\u{1F3A8}', label: 'Toggle Theme', desc: 'Ctrl+Shift+T', fn: function () { document.getElementById('theme-btn').click(); } },
+  { icon: '\u{1F4CB}', label: 'Session Report', desc: '', fn: function () {
+    fetch('/session-report', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var w = window.open('', '_blank');
+        var pre = w.document.createElement('pre');
+        pre.style.cssText = 'font-family:monospace;white-space:pre-wrap;padding:20px';
+        pre.textContent = d.report;
+        w.document.body.appendChild(pre);
+      });
+  }},
+  { icon: '\u{1F50D}', label: 'Search Messages', desc: 'Ctrl+F', fn: function () { document.getElementById('search-input').focus(); } },
+  { icon: '\u{1F4AC}', label: 'Focus Message Input', desc: '/', fn: function () { document.getElementById('msg-text').focus(); } },
+];
+
+function openCmdPalette() {
+  if (cmdOpen) return;
+  cmdOpen = true;
+  var overlay = el('div', { class: 'cmd-overlay' });
+  var palette = el('div', { class: 'cmd-palette' });
+  var inputWrap = el('div', { class: 'cmd-input-wrap' });
+  var input = el('input', { class: 'cmd-input', placeholder: 'Type a command...' });
+  inputWrap.appendChild(input);
+  var list = el('div', { class: 'cmd-list' });
+  var footer = el('div', { class: 'cmd-footer' }, [
+    el('span', null, [el('kbd', null, '\u2191\u2193'), document.createTextNode(' navigate')]),
+    el('span', null, [el('kbd', null, '\u23CE'), document.createTextNode(' select')]),
+    el('span', null, [el('kbd', null, 'esc'), document.createTextNode(' close')]),
+  ]);
+  palette.appendChild(inputWrap);
+  palette.appendChild(list);
+  palette.appendChild(footer);
+  overlay.appendChild(palette);
+  document.body.appendChild(overlay);
+  input.focus();
+
+  var activeIdx = 0;
+  function renderItems(filter) {
+    var items = cmdActions.filter(function (a) { return !filter || a.label.toLowerCase().indexOf(filter.toLowerCase()) >= 0; });
+    if (activeIdx >= items.length) activeIdx = Math.max(0, items.length - 1);
+    clr(list, items.map(function (a, i) {
+      var item = el('div', { class: 'cmd-item' + (i === activeIdx ? ' active' : '') }, [
+        el('span', { class: 'cmd-item-icon' }, a.icon),
+        el('span', { class: 'cmd-item-label' }, a.label),
+        a.desc ? el('span', { class: 'cmd-item-desc' }, a.desc) : null,
+      ]);
+      item.addEventListener('click', function () { closeCmdPalette(); a.fn(); });
+      return item;
+    }));
+    return items;
+  }
+  renderItems('');
+
+  input.addEventListener('input', function () { activeIdx = 0; renderItems(this.value); });
+  input.addEventListener('keydown', function (e) {
+    var items = cmdActions.filter(function (a) { return !input.value || a.label.toLowerCase().indexOf(input.value.toLowerCase()) >= 0; });
+    if (e.key === 'ArrowDown') { e.preventDefault(); activeIdx = Math.min(activeIdx + 1, items.length - 1); renderItems(input.value); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); activeIdx = Math.max(activeIdx - 1, 0); renderItems(input.value); }
+    else if (e.key === 'Enter') { e.preventDefault(); if (items[activeIdx]) { closeCmdPalette(); items[activeIdx].fn(); } }
+    else if (e.key === 'Escape') { closeCmdPalette(); }
+  });
+  overlay.addEventListener('click', function (e) { if (e.target === overlay) closeCmdPalette(); });
+}
+
+function closeCmdPalette() {
+  cmdOpen = false;
+  var overlay = document.querySelector('.cmd-overlay');
+  if (overlay) overlay.remove();
+}
+
+/* ═══ Keyboard Shortcuts ═══ */
+document.addEventListener('keydown', function (e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); openCmdPalette(); return; }
+  if (e.key === 'Escape') {
+    if (cmdOpen) { closeCmdPalette(); return; }
+    var si = document.getElementById('search-input');
+    if (document.activeElement === si) { si.value = ''; searchQuery = ''; applySearch(); si.blur(); }
+    return;
+  }
+  if (e.key === '/' && !e.ctrlKey && !e.metaKey && document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA' && document.activeElement.tagName !== 'SELECT') {
+    e.preventDefault(); document.getElementById('msg-text').focus();
+  }
+});
+
+/* ═══ Browser Notifications ═══ */
+var lastMsgCount = null;
+if ('Notification' in window && Notification.permission === 'default') {
+  Notification.requestPermission();
+}
+
 /* ═══ Render ═══ */
 var lastHash = '';
 var lastData = null;
@@ -278,11 +373,20 @@ var lastDataTime = Date.now();
 function render(d) {
   try {
     lastData = d; lastDataTime = Date.now(); renderGeneration++;
+    var tasks = d.tasks || [];
+    var pinnedMsgs = d.pinned || [];
+    var activeFiles = d.active_files || [];
     var hash = JSON.stringify({
       p: d.peers.map(function (p) { return p.id + (p.name || '') + (p.summary || '') + (p.status || '') + sc(p.last_seen) + (p.group_id || '') }),
       ty: (d.typing || []).join(','),
       m: d.messages.length > 0 ? d.messages[d.messages.length - 1].id + '_' + d.messages.length : '0',
-      g: d.groups.length, s: d.session_id || ''
+      g: d.groups.length, s: d.session_id || '',
+      tk: tasks.length > 0 ? tasks[0].id + '_' + tasks.length : '0',
+      pn: pinnedMsgs.length,
+      af: activeFiles.map(function (a) { return a.peer_id + ':' + a.files.length; }).join(','),
+      rx: JSON.stringify(d.reactions || {}),
+      au: (d.audit || []).length,
+      ap: (d.approvals || []).length
     });
     if (hash === lastHash) return;
     lastHash = hash;
@@ -290,6 +394,20 @@ function render(d) {
     document.getElementById('uptime-el').textContent = uptime(d.uptime_ms || 0);
     document.getElementById('pc').textContent = String(d.peers.length);
     document.getElementById('gc').textContent = String(d.groups.length);
+    document.getElementById('tc').textContent = String(tasks.filter(function (t) { return t.status !== 'completed'; }).length);
+    document.getElementById('fc').textContent = String(activeFiles.reduce(function (n, a) { return n + a.files.length; }, 0));
+
+    /* Browser notification for new messages */
+    if (lastMsgCount !== null && d.messages.length > lastMsgCount && document.hidden) {
+      var newest = d.messages[d.messages.length - 1];
+      var senderName = d.peers.find(function (p) { return p.id === newest.from_id; });
+      var notifTitle = (senderName ? senderName.name : newest.from_id) + ' sent a message';
+      var notifBody = newest.text.slice(0, 120);
+      if (Notification.permission === 'granted') {
+        new Notification(notifTitle, { body: notifBody, icon: '', tag: 'claude-peers-msg' });
+      }
+    }
+    lastMsgCount = d.messages.length;
 
     /* Sidebar: Peers (grouped by isolation group) */
     var pl = document.getElementById('peer-list');
@@ -399,6 +517,98 @@ function render(d) {
     if (!d.groups || d.groups.length === 0) { clr(gl, el('div', { class: 'empty-hint' }, 'No isolation groups')); }
     else { clr(gl, el('div', { class: 'g-chips' }, d.groups.map(function (g) { return el('div', { class: 'g-chip' }, [el('b', null, g.name), document.createTextNode(String(g.member_count))]); }))); }
 
+    /* Sidebar: Tasks */
+    var tl = document.getElementById('task-list');
+    if (tasks.length === 0) { clr(tl, el('div', { class: 'empty-hint' }, 'No tasks')); }
+    else {
+      var taskNodes = tasks.slice(0, 20).map(function (t) {
+        var isDone = t.status === 'completed';
+        var checkBtn = el('button', { class: 'task-check' + (isDone ? ' done' : ''), title: isDone ? 'Completed' : 'Mark complete' }, isDone ? '\u2713' : '');
+        if (!isDone) {
+          checkBtn.addEventListener('click', function () {
+            fetch('/complete-task', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ task_id: t.id, peer_id: 'dashboard', result: '' }) }).catch(function () { });
+          });
+        }
+        var assigneeLabel = t.assignee_id ? (d.peers.find(function (p) { return p.id === t.assignee_id; }) || {}).name || t.assignee_id : '';
+        var meta = [];
+        if (assigneeLabel) meta.push(el('span', { class: 'task-assignee' }, assigneeLabel));
+        meta.push(el('span', null, new Date(t.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })));
+        return el('div', { class: 'task-item' + (isDone ? ' completed' : '') }, [
+          checkBtn,
+          el('div', { class: 'task-body' }, [
+            el('div', { class: 'task-title' }, t.title),
+            el('div', { class: 'task-meta' }, meta),
+          ]),
+        ]);
+      });
+      clr(tl, taskNodes);
+    }
+
+    /* Sidebar: Active Files */
+    var fl = document.getElementById('file-list');
+    if (activeFiles.length === 0) { clr(fl, el('div', { class: 'empty-hint' }, 'No active edits')); }
+    else {
+      // Build conflict map: file -> list of peer names editing it
+      var fileOwners = {};
+      activeFiles.forEach(function (a) {
+        a.files.forEach(function (f) {
+          if (!fileOwners[f]) fileOwners[f] = [];
+          fileOwners[f].push(a.peer_name);
+        });
+      });
+      var fileNodes = [];
+      activeFiles.forEach(function (a) {
+        a.files.forEach(function (f) {
+          var isConflict = fileOwners[f].length > 1;
+          var entry = el('div', { class: 'file-entry' }, [
+            el('span', { class: 'fe-peer' }, a.peer_name),
+            el('span', { class: 'fe-file' + (isConflict ? ' file-conflict' : ''), title: f }, f.split(/[/\\]/).pop()),
+            isConflict ? el('span', { class: 'file-conflict-badge' }, 'CONFLICT') : null,
+          ]);
+          fileNodes.push(entry);
+        });
+      });
+      clr(fl, fileNodes);
+    }
+
+    /* Sidebar: Audit Log */
+    var al = document.getElementById('audit-list');
+    var auditEntries = d.audit || [];
+    if (auditEntries.length === 0) { clr(al, el('div', { class: 'empty-hint' }, 'No activity yet')); }
+    else {
+      clr(al, auditEntries.slice(0, 10).map(function (a) {
+        return el('div', { class: 'audit-entry' }, [
+          el('span', { class: 'ae-time' }, new Date(a.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })),
+          el('span', { class: 'ae-action' }, a.action.split('.').pop()),
+          el('span', { class: 'ae-detail' }, a.actor_name || a.details || a.actor_id),
+        ]);
+      }));
+    }
+
+    /* Pinned messages bar */
+    var pinnedBar = document.getElementById('pinned-bar');
+    if (pinnedMsgs.length === 0) { pinnedBar.style.display = 'none'; }
+    else {
+      pinnedBar.style.display = '';
+      var pinnedNodes = [el('div', { class: 'pinned-title' }, '\u{1F4CC} Pinned')];
+      var pnm = {}; d.peers.forEach(function (p) { pnm[p.id] = p.name || p.id; });
+      pnm['dashboard'] = 'You'; pnm['cli'] = 'CLI';
+      pinnedMsgs.forEach(function (m) {
+        var unpinBtn = el('button', { class: 'pm-unpin', title: 'Unpin' }, '\u00d7');
+        unpinBtn.addEventListener('click', function () {
+          fetch('/pin-message', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message_id: m.id, pinned: false }) }).catch(function () { });
+        });
+        pinnedNodes.push(el('div', { class: 'pinned-msg' }, [
+          el('span', { class: 'pm-from' }, pnm[m.from_id] || m.from_id),
+          el('span', { class: 'pm-text' }, m.text.slice(0, 200)),
+          unpinBtn,
+        ]));
+      });
+      clr(pinnedBar, pinnedNodes);
+    }
+
     /* Name map */
     var nm = {}; d.peers.forEach(function (p) { nm[p.id] = p.name || p.id; });
     nm['dashboard'] = 'You'; nm['cli'] = 'CLI';
@@ -448,7 +658,43 @@ function render(d) {
         })(m.id, m.text, trBtn, textEl));
         footItems.push(trBtn);
       }
-      var bubble = el('div', { class: bubCls }, [textEl, el('div', { class: footCls }, footItems)]);
+
+      /* Pin button for all messages */
+      var isPinned = pinnedMsgs.some(function (pm) { return pm.id === m.id; });
+      var pinBtn = el('button', { class: 'pin-bubble-btn' + (isPinned ? ' pinned' : ''), title: isPinned ? 'Unpin' : 'Pin' }, isPinned ? '\u{1F4CC}' : '\u{1F4CC}');
+      pinBtn.addEventListener('click', (function (msgId, wasPinned) {
+        return function () {
+          fetch('/pin-message', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message_id: msgId, pinned: !wasPinned }) }).catch(function () { });
+        };
+      })(m.id, isPinned));
+      footItems.push(pinBtn);
+
+      /* Reactions display */
+      var reactionsData = (d.reactions || {})[m.id] || [];
+      var reactionsEl = null;
+      if (reactionsData.length > 0) {
+        var emojiCounts = {};
+        reactionsData.forEach(function (r) {
+          if (!emojiCounts[r.emoji]) emojiCounts[r.emoji] = { count: 0, names: [] };
+          emojiCounts[r.emoji].count++;
+          emojiCounts[r.emoji].names.push(r.peer_name);
+        });
+        var chips = Object.keys(emojiCounts).map(function (emoji) {
+          var chip = el('span', { class: 'reaction-chip', title: emojiCounts[emoji].names.join(', ') }, [
+            document.createTextNode(emoji),
+            emojiCounts[emoji].count > 1 ? el('span', { class: 'rc-count' }, String(emojiCounts[emoji].count)) : null,
+          ]);
+          chip.addEventListener('click', function () {
+            fetch('/react', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ message_id: m.id, peer_id: 'dashboard', emoji: emoji }) }).catch(function () { });
+          });
+          return chip;
+        });
+        reactionsEl = el('div', { class: 'bub-reactions' }, chips);
+      }
+
+      var bubble = el('div', { class: bubCls }, [textEl, reactionsEl, el('div', { class: footCls }, footItems)]);
       if (newGroup) {
         var avCls = fromIsUser ? 'm-av av-u' : fromIsCli ? 'm-av av-c' : 'm-av av-p';
         var grpCls = fromIsUser ? 'm-group u-group' : 'm-group p-group';

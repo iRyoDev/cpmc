@@ -352,6 +352,114 @@ const TOOLS = [
       required: ["status"],
     },
   },
+  {
+    name: "create_task",
+    description: "Create a task and optionally assign it to another peer. The assignee will receive a notification message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        title: { type: "string" as const, description: "Task title (max 200 chars)" },
+        description: { type: "string" as const, description: "Optional task description" },
+        assignee: { type: "string" as const, description: "Peer name or ID to assign the task to (optional)" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "complete_task",
+    description: "Mark a task as completed, optionally with a result message. The task creator will be notified.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        task_id: { type: "string" as const, description: "The ID of the task to complete" },
+        result: { type: "string" as const, description: "Optional result or summary of what was done" },
+      },
+      required: ["task_id"],
+    },
+  },
+  {
+    name: "list_tasks",
+    description: "List tasks in the current session. Can filter by status (pending/completed).",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        status: { type: "string" as const, enum: ["pending", "completed"], description: "Filter by task status" },
+      },
+    },
+  },
+  {
+    name: "set_active_files",
+    description: "Report which files you are currently editing. Other peers editing the same files will be flagged as conflicts. Call this when you start or stop editing files.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        files: {
+          type: "array" as const,
+          items: { type: "string" as const },
+          description: "List of file paths you are currently editing. Pass empty array to clear.",
+        },
+      },
+      required: ["files"],
+    },
+  },
+  {
+    name: "pin_message",
+    description: "Pin or unpin a message. Pinned messages stay visible at the top of the dashboard chat.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message_id: { type: "number" as const, description: "The message ID to pin/unpin" },
+        pinned: { type: "boolean" as const, description: "true to pin, false to unpin (default: true)" },
+      },
+      required: ["message_id"],
+    },
+  },
+  {
+    name: "react",
+    description: "Add or remove an emoji reaction on a message. Lightweight feedback without a full reply.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        message_id: { type: "number" as const, description: "The message ID to react to" },
+        emoji: { type: "string" as const, description: "Emoji to react with: 👍 👀 ✅ ⚠️ ❌ 🎉 ❤️ 🤔" },
+        remove: { type: "boolean" as const, description: "true to remove the reaction (default: false)" },
+      },
+      required: ["message_id", "emoji"],
+    },
+  },
+  {
+    name: "request_approval",
+    description: "Request approval from another peer before taking a potentially dangerous action. The approver receives a notification and can accept or reject.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        approver: { type: "string" as const, description: "Peer name or ID to request approval from" },
+        action: { type: "string" as const, description: "Description of the action you want to take" },
+      },
+      required: ["approver", "action"],
+    },
+  },
+  {
+    name: "respond_approval",
+    description: "Accept or reject an approval request from another peer.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        approval_id: { type: "string" as const, description: "The approval request ID" },
+        approved: { type: "boolean" as const, description: "true to approve, false to reject" },
+        reason: { type: "string" as const, description: "Optional reason for the decision" },
+      },
+      required: ["approval_id", "approved"],
+    },
+  },
+  {
+    name: "session_report",
+    description: "Generate a structured markdown report of the current session: participants, tasks, messages, activity log.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -641,6 +749,139 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "create_task": {
+      const { title, description, assignee } = args as { title: string; description?: string; assignee?: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        let assigneeId = assignee;
+        if (assignee) {
+          const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+          const byName = peers.find((p) => p.name === assignee);
+          if (byName) assigneeId = byName.id;
+        }
+        const result = await brokerFetch<{ ok: boolean; id?: string; error?: string }>("/create-task", {
+          title, description: description || "", creator_id: myId, assignee_id: assigneeId,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Task created (${result.id})${assigneeId ? ` and assigned to ${assignee}` : ""}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "complete_task": {
+      const { task_id, result } = args as { task_id: string; result?: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const res = await brokerFetch<{ ok: boolean; error?: string }>("/complete-task", { task_id, peer_id: myId, result });
+        if (!res.ok) return { content: [{ type: "text" as const, text: `Failed: ${res.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Task ${task_id} marked as completed` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "list_tasks": {
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const status = (args as { status?: string }).status;
+        const result = await brokerFetch<{ tasks: any[] }>("/list-tasks", { peer_id: myId, status });
+        if (result.tasks.length === 0) return { content: [{ type: "text" as const, text: "No tasks found." }] };
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+        const nm: Record<string, string> = {};
+        peers.forEach((p) => { nm[p.id] = p.name || p.id; });
+        nm[myId] = myName || myId;
+        const lines = result.tasks.map((t: any) => {
+          const assignee = t.assignee_id ? (nm[t.assignee_id] || t.assignee_id) : "unassigned";
+          const st = t.status === "completed" ? "[done]" : "[pending]";
+          return `${st} ${t.id}: ${t.title} (assignee: ${assignee})`;
+        });
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "set_active_files": {
+      const { files } = args as { files: string[] };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; conflicts?: Array<{ file: string; peer_name: string }> }>("/set-active-files", { id: myId, files });
+        if (result.conflicts && result.conflicts.length > 0) {
+          const warnings = result.conflicts.map((c) => `  - ${c.file} (also edited by ${c.peer_name})`);
+          return { content: [{ type: "text" as const, text: `Active files updated. CONFLICTS detected:\n${warnings.join("\n")}` }] };
+        }
+        return { content: [{ type: "text" as const, text: `Active files updated (${files.length} file${files.length !== 1 ? "s" : ""})` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "pin_message": {
+      const { message_id, pinned } = args as { message_id: number; pinned?: boolean };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/pin-message", { message_id, pinned: pinned !== false });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Message ${message_id} ${pinned !== false ? "pinned" : "unpinned"}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "react": {
+      const { message_id, emoji, remove } = args as { message_id: number; emoji: string; remove?: boolean };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/react", { message_id, peer_id: myId, emoji, remove: remove === true });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `${remove ? "Removed" : "Added"} ${emoji} reaction` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "request_approval": {
+      const { approver, action } = args as { approver: string; action: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        let approverId = approver;
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+        const byName = peers.find((p) => p.name === approver);
+        if (byName) approverId = byName.id;
+        const result = await brokerFetch<{ ok: boolean; id?: string; error?: string }>("/request-approval", {
+          requester_id: myId, approver_id: approverId, action_description: action,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Approval requested (ID: ${result.id}). Waiting for ${approver} to respond.` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "respond_approval": {
+      const { approval_id, approved, reason } = args as { approval_id: string; approved: boolean; reason?: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/respond-approval", {
+          approval_id, peer_id: myId, approved, reason,
+        });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Approval ${approved ? "granted" : "rejected"}${reason ? `: ${reason}` : ""}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "session_report": {
+      try {
+        const result = await brokerFetch<{ report: string }>("/session-report", {});
+        return { content: [{ type: "text" as const, text: result.report }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -653,10 +894,12 @@ async function reconnectToBroker() {
   try {
     await ensureBroker();
     const tty = getTty();
+    const branch = await getGitBranch(myCwd);
     const reg = await brokerFetch<RegisterResponse>("/register", {
       pid: process.pid,
       cwd: myCwd,
       git_root: myGitRoot,
+      git_branch: branch,
       tty,
       summary: "",
     });
@@ -795,7 +1038,7 @@ async function main() {
     clearInterval(heartbeatTimer);
     if (myId) {
       try {
-        await brokerFetch("/unregister", { id: myId });
+        await brokerFetch("/unregister", { id: myId, broadcast_departure: true });
         log.info("Unregistered from broker");
       } catch {
         // Best effort

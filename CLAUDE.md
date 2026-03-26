@@ -10,13 +10,15 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Architecture
 
-- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Serves web dashboard at http://localhost:7899.
-- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications. Auto-reconnects if broker restarts.
+- `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server. Serves web dashboard at http://localhost:7899. Manages peers, messages, isolation groups, tasks, approvals, reactions, audit log.
+- `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications. Auto-reconnects if broker restarts. Detects git branch for auto-grouping.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Git context utilities (branch, recent files).
 - `shared/log.ts` — Structured logging utility (respects LOG_LEVEL env var).
-- `dashboard.html` — Web dashboard served by the broker.
+- `dashboard.html` — Web dashboard CSS and HTML structure served by the broker.
+- `dashboard.js` — Dashboard JavaScript (rendering, WebSocket, command palette, interactions).
 - `cli.ts` — CLI utility for inspecting broker state.
+- `broker.test.ts` — Test suite (22 tests, run with `bun test broker`).
 
 ## Running
 

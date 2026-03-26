@@ -121,6 +121,48 @@ db.run(`
   )
 `);
 
+// --- Feature: audit log ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    action TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    actor_name TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT '',
+    group_id TEXT,
+    created_at TEXT NOT NULL
+  )
+`);
+db.run("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at)");
+
+// --- Feature: message reactions ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS reactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    peer_id TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(message_id, peer_id, emoji),
+    FOREIGN KEY (message_id) REFERENCES messages(id)
+  )
+`);
+
+// --- Feature: approval requests ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS approvals (
+    id TEXT PRIMARY KEY,
+    requester_id TEXT NOT NULL,
+    approver_id TEXT NOT NULL,
+    action_description TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    group_id TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    session_id TEXT NOT NULL DEFAULT ''
+  )
+`);
+
 // --- Feature: active files (edit conflict detection) ---
 // Stored in-memory for performance (files change frequently)
 // Map<peer_id, { files: string[], updated_at: number }>
@@ -133,6 +175,17 @@ db.run("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)"
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at)");
 db.run("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id)");
 db.run("CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks(group_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_approvals_session ON approvals(session_id)");
+
+// --- Audit log helper ---
+function audit(action: string, actorId: string, details: string = "", groupId: string | null = null) {
+  const actorRow = db.query("SELECT name FROM peers WHERE id = ?").get(actorId) as { name: string } | null;
+  const actorName = actorRow?.name || (VIRTUAL_PEERS.has(actorId) ? actorId : "");
+  db.run(
+    "INSERT INTO audit_log (action, actor_id, actor_name, details, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    [action, actorId, actorName, details, groupId, new Date().toISOString()]
+  );
+}
 
 const BROKER_START_TIME = Date.now();
 
@@ -602,6 +655,7 @@ function handleRegister(body: RegisterRequest & { git_branch?: string | null }):
 
   const id = generateId();
   insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, groupId, branch);
+  audit("peer.register", id, `${name} joined from ${body.cwd}`, groupId);
   return { id, name };
 }
 
@@ -721,7 +775,22 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   return { messages };
 }
 
-function handleUnregister(body: { id: string }): void {
+function handleUnregister(body: { id: string; broadcast_departure?: boolean }): void {
+  // Get peer info before deletion for audit + departure broadcast
+  const peer = db.query("SELECT name, group_id FROM peers WHERE id = ?").get(body.id) as { name: string; group_id: string | null } | null;
+  audit("peer.disconnect", body.id, peer?.name || body.id, peer?.group_id ?? null);
+
+  // Broadcast departure notice to group members
+  if (body.broadcast_departure && peer) {
+    const now = new Date().toISOString();
+    const groupFilter = peer.group_id ? "AND group_id = ?" : "AND group_id IS NULL";
+    const params = peer.group_id ? [body.id, peer.group_id] : [body.id];
+    const groupPeers = db.query(`SELECT id FROM peers WHERE id != ? ${groupFilter}`).all(...params) as { id: string }[];
+    for (const gp of groupPeers) {
+      insertMessage.run(body.id, gp.id, `**${peer.name || body.id}** has gone offline.`, now, currentSessionId);
+    }
+  }
+
   db.run("DELETE FROM peer_groups WHERE peer_id = ?", [body.id]);
   activeFilesMap.delete(body.id);
   deletePeer.run(body.id);
@@ -995,6 +1064,183 @@ function getActiveFilesState(): Array<{ peer_id: string; peer_name: string; file
   return result;
 }
 
+// --- Feature: Message Reactions ---
+
+function handleReaction(body: { message_id: number; peer_id: string; emoji: string; remove?: boolean }): { ok: boolean; error?: string } {
+  const validEmojis = ["👍", "👀", "✅", "⚠️", "❌", "🎉", "❤️", "🤔"];
+  if (!validEmojis.includes(body.emoji)) return { ok: false, error: `Invalid emoji. Use: ${validEmojis.join(" ")}` };
+  const msg = db.query("SELECT id FROM messages WHERE id = ?").get(body.message_id);
+  if (!msg) return { ok: false, error: "Message not found" };
+
+  if (body.remove) {
+    db.run("DELETE FROM reactions WHERE message_id = ? AND peer_id = ? AND emoji = ?", [body.message_id, body.peer_id, body.emoji]);
+  } else {
+    db.run("INSERT OR IGNORE INTO reactions (message_id, peer_id, emoji, created_at) VALUES (?, ?, ?, ?)",
+      [body.message_id, body.peer_id, body.emoji, new Date().toISOString()]);
+  }
+  return { ok: true };
+}
+
+function getReactionsForMessages(messageIds: number[]): Record<number, Array<{ emoji: string; peer_id: string; peer_name: string }>> {
+  if (messageIds.length === 0) return {};
+  const placeholders = messageIds.map(() => "?").join(",");
+  const rows = db.query(`SELECT r.message_id, r.emoji, r.peer_id, COALESCE(p.name, r.peer_id) as peer_name
+    FROM reactions r LEFT JOIN peers p ON r.peer_id = p.id
+    WHERE r.message_id IN (${placeholders}) ORDER BY r.created_at ASC`).all(...messageIds) as any[];
+  const result: Record<number, any[]> = {};
+  for (const row of rows) {
+    if (!result[row.message_id]) result[row.message_id] = [];
+    result[row.message_id].push({ emoji: row.emoji, peer_id: row.peer_id, peer_name: row.peer_name });
+  }
+  return result;
+}
+
+// --- Feature: Approval Workflow ---
+
+function handleRequestApproval(body: { requester_id: string; approver_id: string; action_description: string }): { ok: boolean; id?: string; error?: string } {
+  if (!canCommunicate(body.requester_id, body.approver_id)) {
+    return { ok: false, error: "Cannot request approval from peers in a different group" };
+  }
+  const id = generateId();
+  const now = new Date().toISOString();
+  const groupId = getPeerGroupId(body.requester_id) ?? null;
+  db.run(
+    "INSERT INTO approvals (id, requester_id, approver_id, action_description, status, group_id, created_at, session_id) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+    [id, body.requester_id, body.approver_id, body.action_description, groupId, now, currentSessionId]
+  );
+  // Send notification to approver
+  const requesterName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.requester_id) as any)?.name || body.requester_id;
+  insertMessage.run(body.requester_id, body.approver_id,
+    `**Approval requested:** ${body.action_description}\n\nApproval ID: \`${id}\`\nUse \`respond_approval\` to accept or reject.`,
+    now, currentSessionId);
+  audit("approval.request", body.requester_id, body.action_description, groupId);
+  return { ok: true, id };
+}
+
+function handleRespondApproval(body: { approval_id: string; peer_id: string; approved: boolean; reason?: string }): { ok: boolean; error?: string } {
+  const approval = db.query("SELECT * FROM approvals WHERE id = ?").get(body.approval_id) as any;
+  if (!approval) return { ok: false, error: "Approval not found" };
+  if (approval.status !== "pending") return { ok: false, error: `Already ${approval.status}` };
+  if (approval.approver_id !== body.peer_id) return { ok: false, error: "Not the designated approver" };
+
+  const newStatus = body.approved ? "approved" : "rejected";
+  db.run("UPDATE approvals SET status = ?, resolved_at = ? WHERE id = ?",
+    [newStatus, new Date().toISOString(), body.approval_id]);
+
+  const approverName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as any)?.name || body.peer_id;
+  const statusEmoji = body.approved ? "✅" : "❌";
+  insertMessage.run(body.peer_id, approval.requester_id,
+    `${statusEmoji} **Approval ${newStatus}:** ${approval.action_description}${body.reason ? `\n**Reason:** ${body.reason}` : ""}`,
+    new Date().toISOString(), currentSessionId);
+  audit(`approval.${newStatus}`, body.peer_id, approval.action_description, approval.group_id);
+  return { ok: true };
+}
+
+function handleListApprovals(body: { peer_id?: string; status?: string }): { approvals: any[] } {
+  let query = "SELECT * FROM approvals WHERE session_id = ?";
+  const params: any[] = [currentSessionId];
+  if (body.peer_id) { query += " AND (requester_id = ? OR approver_id = ?)"; params.push(body.peer_id, body.peer_id); }
+  if (body.status) { query += " AND status = ?"; params.push(body.status); }
+  query += " ORDER BY created_at DESC LIMIT 50";
+  return { approvals: db.query(query).all(...params) as any[] };
+}
+
+// --- Feature: Session Report ---
+
+function handleSessionReport(): { report: string } {
+  const peers = selectAllPeers.all() as Peer[];
+  const messages = db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY sent_at ASC").all(currentSessionId) as Message[];
+  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as any[];
+  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as any[];
+  const groups = db.query("SELECT id, name FROM isolation_groups").all() as any[];
+  const auditRows = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200").all() as any[];
+
+  // Build name map
+  const nm: Record<string, string> = { dashboard: "Dashboard", cli: "CLI" };
+  peers.forEach(p => { nm[p.id] = p.name || p.id; });
+
+  // Gather active files
+  const af = getActiveFilesState();
+
+  const sessionStart = messages.length > 0 ? messages[0].sent_at : new Date().toISOString();
+  const duration = messages.length > 0 ? Math.round((Date.now() - new Date(sessionStart).getTime()) / 60000) : 0;
+
+  let md = `# Session Report\n\n`;
+  md += `**Session ID:** \`${currentSessionId}\`\n`;
+  md += `**Started:** ${new Date(sessionStart).toLocaleString()}\n`;
+  md += `**Duration:** ${duration} minutes\n`;
+  md += `**Peers:** ${peers.length} active\n\n`;
+
+  // Participants
+  md += `## Participants\n\n`;
+  for (const p of peers) {
+    const groupName = p.group_id ? (groups.find((g: any) => g.id === p.group_id)?.name || "Unknown") : "Lobby";
+    md += `- **${p.name || p.id}** — ${p.cwd} (${groupName})${p.summary ? ` — *${p.summary}*` : ""}\n`;
+  }
+
+  // Groups
+  if (groups.length > 0) {
+    md += `\n## Groups\n\n`;
+    for (const g of groups) {
+      const members = peers.filter(p => (p as any).group_id === g.id);
+      md += `- **${g.name}**: ${members.map(m => m.name || m.id).join(", ") || "empty"}\n`;
+    }
+  }
+
+  // Tasks
+  const pendingTasks = tasks.filter(t => t.status !== "completed");
+  const completedTasks = tasks.filter(t => t.status === "completed");
+  if (tasks.length > 0) {
+    md += `\n## Tasks (${completedTasks.length}/${tasks.length} completed)\n\n`;
+    for (const t of tasks) {
+      const check = t.status === "completed" ? "x" : " ";
+      const assignee = t.assignee_id ? (nm[t.assignee_id] || t.assignee_id) : "unassigned";
+      md += `- [${check}] **${t.title}** (${assignee})${t.result ? ` — ${t.result}` : ""}\n`;
+    }
+  }
+
+  // Approvals
+  if (approvals.length > 0) {
+    md += `\n## Approval Decisions\n\n`;
+    for (const a of approvals) {
+      const icon = a.status === "approved" ? "✅" : a.status === "rejected" ? "❌" : "⏳";
+      md += `- ${icon} ${a.action_description} (${nm[a.requester_id] || a.requester_id} → ${nm[a.approver_id] || a.approver_id})\n`;
+    }
+  }
+
+  // Active files
+  if (af.length > 0) {
+    md += `\n## Files In Progress\n\n`;
+    for (const entry of af) {
+      md += `- **${entry.peer_name}**: ${entry.files.join(", ")}\n`;
+    }
+  }
+
+  // Message stats
+  md += `\n## Message Stats\n\n`;
+  md += `- **Total messages:** ${messages.length}\n`;
+  const byPeer: Record<string, number> = {};
+  messages.forEach(m => { byPeer[m.from_id] = (byPeer[m.from_id] || 0) + 1; });
+  for (const [id, count] of Object.entries(byPeer).sort((a, b) => b[1] - a[1])) {
+    md += `- ${nm[id] || id}: ${count} messages\n`;
+  }
+
+  // Recent audit log
+  md += `\n## Recent Activity\n\n`;
+  for (const a of auditRows.slice(0, 20)) {
+    md += `- \`${new Date(a.created_at).toLocaleTimeString()}\` **${a.action}** — ${a.actor_name || a.actor_id}${a.details ? `: ${a.details}` : ""}\n`;
+  }
+
+  return { report: md };
+}
+
+// --- Feature: Audit Log query ---
+
+function handleGetAuditLog(body: { limit?: number }): { entries: any[] } {
+  const limit = body.limit ?? 50;
+  return { entries: db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?").all(limit) as any[] };
+}
+
 function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryResponse {
   // Enforce group isolation — peers in different groups cannot view each other's history
   if (!canCommunicate(body.peer_a, body.peer_b)) {
@@ -1022,6 +1268,12 @@ function getDashboardState() {
   const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 100").all(currentSessionId) as any[];
   const pinnedMessages = db.query("SELECT * FROM messages WHERE session_id = ? AND pinned = 1 ORDER BY sent_at ASC").all(currentSessionId) as Message[];
   const activeFiles = getActiveFilesState();
+  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as any[];
+  const recentAudit = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 15").all() as any[];
+
+  // Gather reactions for displayed messages
+  const msgIds = messages.map((m: Message) => m.id);
+  const reactions = getReactionsForMessages(msgIds);
 
   return {
     peers,
@@ -1031,6 +1283,9 @@ function getDashboardState() {
     tasks,
     pinned: pinnedMessages,
     active_files: activeFiles,
+    approvals,
+    audit: recentAudit,
+    reactions,
     session_id: currentSessionId,
     uptime_ms: Date.now() - BROKER_START_TIME,
   };
@@ -1104,9 +1359,12 @@ Bun.serve({
           return Response.json(handleSendMessage(validateSendMessageRequest(body)));
         case "/poll-messages":
           return Response.json(handlePollMessages(validatePollMessagesRequest(body)));
-        case "/unregister":
-          handleUnregister(validateUnregisterRequest(body));
+        case "/unregister": {
+          const unreg = validateUnregisterRequest(body);
+          const rawBody = body as Record<string, unknown>;
+          handleUnregister({ ...unreg, broadcast_departure: rawBody.broadcast_departure === true });
           return Response.json({ ok: true });
+        }
         case "/broadcast":
           return Response.json(handleBroadcast(validateBroadcastRequest(body)));
         case "/ack-message":
@@ -1174,6 +1432,45 @@ Bun.serve({
           const b = validateBody(body);
           const files = Array.isArray(b.files) ? b.files.filter((f: unknown) => typeof f === "string") : [];
           return Response.json(handleSetActiveFiles({ id: validateString(b.id, "id"), files }));
+        }
+        case "/react": {
+          const b = validateBody(body);
+          return Response.json(handleReaction({
+            message_id: validateNumber(b.message_id, "message_id"),
+            peer_id: validateString(b.peer_id, "peer_id"),
+            emoji: validateString(b.emoji, "emoji"),
+            remove: b.remove === true,
+          }));
+        }
+        case "/request-approval": {
+          const b = validateBody(body);
+          return Response.json(handleRequestApproval({
+            requester_id: validateString(b.requester_id, "requester_id"),
+            approver_id: validateString(b.approver_id, "approver_id"),
+            action_description: validateString(b.action_description, "action_description"),
+          }));
+        }
+        case "/respond-approval": {
+          const b = validateBody(body);
+          return Response.json(handleRespondApproval({
+            approval_id: validateString(b.approval_id, "approval_id"),
+            peer_id: validateString(b.peer_id, "peer_id"),
+            approved: b.approved === true,
+            reason: typeof b.reason === "string" ? b.reason : undefined,
+          }));
+        }
+        case "/list-approvals": {
+          const b = validateBody(body);
+          return Response.json(handleListApprovals({
+            peer_id: typeof b.peer_id === "string" ? b.peer_id : undefined,
+            status: typeof b.status === "string" ? b.status : undefined,
+          }));
+        }
+        case "/session-report":
+          return Response.json(handleSessionReport());
+        case "/audit-log": {
+          const b = validateBody(body);
+          return Response.json(handleGetAuditLog({ limit: typeof b.limit === "number" ? b.limit : undefined }));
         }
         default:
           return Response.json({ error: "not found" }, { status: 404 });
