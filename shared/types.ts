@@ -9,9 +9,11 @@ export interface Peer {
   pid: number;
   cwd: string;
   git_root: string | null;
+  git_branch: string | null;
   tty: string | null;
   summary: string;
   status: PeerStatus;
+  group_id: string | null; // isolation group ID, null = lobby
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -32,6 +34,7 @@ export interface RegisterRequest {
   pid: number;
   cwd: string;
   git_root: string | null;
+  git_branch?: string | null;
   tty: string | null;
   summary: string;
 }
@@ -109,32 +112,30 @@ export interface CheckAcksResponse {
   messages: Message[];
 }
 
-// --- Peer Groups ---
+// --- Isolation Groups ---
 
-export interface JoinGroupRequest {
-  id: PeerId;
-  group: string;
+export interface CreateGroupRequest {
+  name: string;
 }
 
-export interface LeaveGroupRequest {
-  id: PeerId;
-  group: string;
+export interface AssignGroupRequest {
+  peer_id: PeerId;
+  group_id: string | null;
 }
 
-export interface SendToGroupRequest {
-  from_id: PeerId;
-  group: string;
-  text: string;
+export interface DeleteGroupRequest {
+  group_id: string;
 }
 
-export interface SendToGroupResponse {
-  ok: boolean;
-  sent_to: number;
-  error?: string;
+export interface IsolationGroup {
+  id: string;
+  name: string;
+  member_count: number;
+  members: Array<{ id: PeerId; name: string }>;
 }
 
-export interface ListGroupsResponse {
-  groups: Array<{ name: string; member_count: number }>;
+export interface ListIsolationGroupsResponse {
+  groups: IsolationGroup[];
 }
 
 // --- Presence ---
@@ -154,4 +155,28 @@ export interface MessageHistoryRequest {
 
 export interface MessageHistoryResponse {
   messages: Message[];
+}
+
+// --- Tasks ---
+
+export interface Task {
+  id: string;
+  title: string;
+  description: string;
+  creator_id: PeerId;
+  assignee_id: PeerId | null;
+  group_id: string | null;
+  status: "pending" | "in_progress" | "completed";
+  result: string;
+  created_at: string;
+  completed_at: string | null;
+  session_id: string;
+}
+
+// --- Active Files ---
+
+export interface ActiveFilesEntry {
+  peer_id: PeerId;
+  peer_name: string;
+  files: string[];
 }

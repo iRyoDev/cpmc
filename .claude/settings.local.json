@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bun server.ts)",
+      "Bash(cmd.exe /c 'echo %PATH%')",
+      "Bash(tr ';' '\\\\n')",
+      "Bash(cmd.exe /c 'where bun')",
+      "Bash(cmd.exe /c \"where claude\" 2>/dev/null)",
+      "Bash(bun cli.ts status)",
+      "Bash(bunx tsc:*)",
+      "Bash(bun cli.ts kill-broker)",
+      "Bash(grep -A 8 '\"\"mcpServers\"\"' \"/c/Users/iRyo/.claude.json\")",
+      "Bash(bun build:*)",
+      "Bash(bun test:*)"
+    ]
+  }
+}

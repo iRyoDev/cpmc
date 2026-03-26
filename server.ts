@@ -26,8 +26,6 @@ import type {
   PollMessagesResponse,
   Message,
   BroadcastResponse,
-  SendToGroupResponse,
-  ListGroupsResponse,
 } from "./shared/types.ts";
 import { createLogger } from "./shared/log.ts";
 
@@ -114,6 +112,23 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   return null;
 }
 
+async function getGitBranch(cwd: string): Promise<string | null> {
+  try {
+    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
+      cwd,
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const text = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code === 0) {
+      const branch = text.trim();
+      return branch === "HEAD" ? null : branch; // detached HEAD
+    }
+  } catch { /* not a git repo */ }
+  return null;
+}
+
 function getTty(): string | null {
   if (process.platform === "win32") return null;
   try {
@@ -176,10 +191,6 @@ Available tools:
 - check_messages: Manually check for new messages
 - ack_message: Acknowledge receipt of a message (use message_id from channel notification)
 - check_acks: See if your sent messages have been acknowledged
-- join_group: Join a named group/room for scoped communication
-- leave_group: Leave a named group/room
-- send_to_group: Send a message to all members of a group
-- list_groups: List available groups and their member counts
 - message_history: Retrieve past conversation with a specific peer
 - set_status: Set your presence (online/away/busy)
 
@@ -315,61 +326,6 @@ const TOOLS = [
     },
   },
   {
-    name: "join_group",
-    description:
-      "Join a named group/room. Other peers in the same group can send messages to all group members at once.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        group: {
-          type: "string" as const,
-          description: "The group name to join",
-        },
-      },
-      required: ["group"],
-    },
-  },
-  {
-    name: "leave_group",
-    description: "Leave a named group/room.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        group: {
-          type: "string" as const,
-          description: "The group name to leave",
-        },
-      },
-      required: ["group"],
-    },
-  },
-  {
-    name: "send_to_group",
-    description: "Send a message to all members of a named group/room.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        group: {
-          type: "string" as const,
-          description: "The group name",
-        },
-        message: {
-          type: "string" as const,
-          description: "The message to send",
-        },
-      },
-      required: ["group", "message"],
-    },
-  },
-  {
-    name: "list_groups",
-    description: "List available groups and their member counts.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {},
-    },
-  },
-  {
     name: "message_history",
     description: "Retrieve past messages between you and another peer in the current session.",
     inputSchema: {
@@ -437,6 +393,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
+          parts.push(`Group: ${p.group_id ? p.group_id : "lobby"}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
         });
@@ -641,61 +598,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
-    case "join_group": {
-      const { group } = args as { group: string };
-      if (!myId) {
-        return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
-      }
-      try {
-        await brokerFetch("/join-group", { id: myId, group });
-        return { content: [{ type: "text" as const, text: `Joined group "${group}"` }] };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
-      }
-    }
-
-    case "leave_group": {
-      const { group } = args as { group: string };
-      if (!myId) {
-        return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
-      }
-      try {
-        await brokerFetch("/leave-group", { id: myId, group });
-        return { content: [{ type: "text" as const, text: `Left group "${group}"` }] };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
-      }
-    }
-
-    case "send_to_group": {
-      const { group, message } = args as { group: string; message: string };
-      if (!myId) {
-        return { content: [{ type: "text" as const, text: "Not registered with broker yet" }], isError: true };
-      }
-      try {
-        const result = await brokerFetch<SendToGroupResponse>("/send-to-group", { from_id: myId, group, text: message });
-        if (!result.ok) {
-          return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
-        }
-        return { content: [{ type: "text" as const, text: `Message sent to ${result.sent_to} member(s) of "${group}"` }] };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
-      }
-    }
-
-    case "list_groups": {
-      try {
-        const result = await brokerFetch<ListGroupsResponse>("/list-groups", {});
-        if (result.groups.length === 0) {
-          return { content: [{ type: "text" as const, text: "No groups exist yet." }] };
-        }
-        const lines = result.groups.map((g) => `${g.name} (${g.member_count} member(s))`);
-        return { content: [{ type: "text" as const, text: `Groups:\n${lines.join("\n")}` }] };
-      } catch (e) {
-        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
-      }
-    }
-
     case "message_history": {
       const { peer_id, limit } = args as { peer_id: string; limit?: number };
       if (!myId) {
@@ -772,7 +674,7 @@ async function reconnectToBroker() {
 function triggerReconnect() {
   if (reconnectPromise) return;
   reconnectPromise = reconnectToBroker()
-    .catch(() => {}) // swallow — already logged inside reconnectToBroker
+    .catch(() => { }) // swallow — already logged inside reconnectToBroker
     .finally(() => { reconnectPromise = null; });
 }
 
@@ -844,10 +746,12 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  const myBranch = await getGitBranch(myCwd);
   const tty = getTty();
 
   log.info(`CWD: ${myCwd}`);
   log.info(`Git root: ${myGitRoot ?? "(none)"}`);
+  log.info(`Git branch: ${myBranch ?? "(none)"}`);
   log.info(`TTY: ${tty ?? "(unknown)"}`);
 
   // 3. Register with broker (summary is set later by Claude via set_summary tool)
@@ -855,6 +759,7 @@ async function main() {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
+    git_branch: myBranch,
     tty,
     summary: "",
   });

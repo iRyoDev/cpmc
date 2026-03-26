@@ -26,11 +26,6 @@ import type {
   AckMessageRequest,
   CheckAcksRequest,
   CheckAcksResponse,
-  JoinGroupRequest,
-  LeaveGroupRequest,
-  SendToGroupRequest,
-  SendToGroupResponse,
-  ListGroupsResponse,
   SetNameRequest,
   SetStatusRequest,
   MessageHistoryRequest,
@@ -41,6 +36,7 @@ import type {
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
+const SKIP_PID_CHECK = process.env.CLAUDE_PEERS_SKIP_PID_CHECK === "1";
 
 // --- Database setup ---
 
@@ -91,36 +87,149 @@ db.run(`
 // Schema migrations
 try { db.run("ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
 try { db.run("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'online'"); } catch { /* already exists */ }
+try { db.run("ALTER TABLE peers ADD COLUMN group_id TEXT DEFAULT NULL"); } catch { /* already exists */ }
+
+// Isolation groups table
+db.run(`
+  CREATE TABLE IF NOT EXISTS isolation_groups (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL
+  )
+`);
+
+// --- Feature: git branch tracking (auto-grouping) ---
+try { db.run("ALTER TABLE peers ADD COLUMN git_branch TEXT DEFAULT NULL"); } catch { /* already exists */ }
+
+// --- Feature: message pinning ---
+try { db.run("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+
+// --- Feature: tasks ---
+db.run(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    creator_id TEXT NOT NULL,
+    assignee_id TEXT,
+    group_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    result TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    session_id TEXT NOT NULL DEFAULT ''
+  )
+`);
+
+// --- Feature: active files (edit conflict detection) ---
+// Stored in-memory for performance (files change frequently)
+// Map<peer_id, { files: string[], updated_at: number }>
+const activeFilesMap = new Map<string, { files: string[]; updated_at: number }>();
+const ACTIVE_FILES_TIMEOUT_MS = 60_000; // expire after 60s without update
 
 // Performance indices
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_to_delivered ON messages(to_id, delivered)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id)");
 db.run("CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at)");
+db.run("CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id)");
+db.run("CREATE INDEX IF NOT EXISTS idx_tasks_group ON tasks(group_id)");
 
 const BROKER_START_TIME = Date.now();
 
-// --- Session tracking ---
-let currentSessionId = crypto.randomUUID();
+// --- Key-value store for persistent settings ---
+db.run(`CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+
+// --- Session tracking (persisted) ---
+function loadOrCreateSessionId(): string {
+  const row = db.query("SELECT value FROM kv WHERE key = 'session_id'").get() as { value: string } | null;
+  if (row) return row.value;
+  const id = crypto.randomUUID();
+  db.run("INSERT INTO kv (key, value) VALUES ('session_id', ?)", [id]);
+  return id;
+}
+
+function persistSessionId(id: string): void {
+  db.run("INSERT OR REPLACE INTO kv (key, value) VALUES ('session_id', ?)", [id]);
+}
+
+// Determine if we should start a fresh session:
+// Only if there are zero peers AND no recent messages (last 5 minutes)
+function shouldResetSession(): boolean {
+  const peerCount = (db.query("SELECT COUNT(*) as cnt FROM peers").get() as { cnt: number }).cnt;
+  if (peerCount > 0) return false;
+  const recentMsg = db.query(
+    "SELECT id FROM messages WHERE sent_at > ? LIMIT 1"
+  ).get(new Date(Date.now() - 5 * 60 * 1000).toISOString()) as { id: number } | null;
+  return !recentMsg;
+}
+
+let currentSessionId: string;
+if (shouldResetSession()) {
+  currentSessionId = crypto.randomUUID();
+  persistSessionId(currentSessionId);
+} else {
+  currentSessionId = loadOrCreateSessionId();
+}
 
 // Typing indicators (in-memory, not persisted)
 const typingState = new Map<string, number>();
 const TYPING_TIMEOUT_MS = 5000;
 
-// Clean up stale peers (PIDs that no longer exist) on startup
+// Cross-platform process existence check (single PID — used in handleListPeers)
+function isProcessAlive(pid: number): boolean {
+  if (SKIP_PID_CHECK) return true;
+  if (process.platform === "win32") {
+    try {
+      const proc = Bun.spawnSync(["tasklist", "/FI", `PID eq ${pid}`, "/NH", "/FO", "CSV"]);
+      const output = new TextDecoder().decode(proc.stdout);
+      return output.includes(String(pid));
+    } catch { return false; }
+  }
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+// Batched alive check — one tasklist call for all PIDs (Windows optimization)
+function getAlivePids(pidsToCheck: number[]): Set<number> {
+  if (pidsToCheck.length === 0) return new Set();
+  if (SKIP_PID_CHECK) return new Set(pidsToCheck);
+  if (process.platform === "win32") {
+    try {
+      const proc = Bun.spawnSync(["tasklist", "/FO", "CSV", "/NH"]);
+      const output = new TextDecoder().decode(proc.stdout);
+      const alive = new Set<number>();
+      const checkSet = new Set(pidsToCheck);
+      for (const line of output.split("\n")) {
+        // CSV format: "Image Name","PID","Session Name","Session#","Mem Usage"
+        const match = line.match(/^"[^"]*","(\d+)"/);
+        if (match) {
+          const pid = parseInt(match[1], 10);
+          if (checkSet.has(pid)) alive.add(pid);
+        }
+      }
+      return alive;
+    } catch { return new Set(); }
+  }
+  // Unix: check each individually (signal 0 is fast)
+  const alive = new Set<number>();
+  for (const pid of pidsToCheck) {
+    try { process.kill(pid, 0); alive.add(pid); } catch { /* dead */ }
+  }
+  return alive;
+}
+
+// Clean up stale peers (PIDs that no longer exist)
 function cleanStalePeers() {
   const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  if (peers.length === 0) return;
+  const alivePids = getAlivePids(peers.map(p => p.pid));
   for (const peer of peers) {
-    try {
-      // Check if process is still alive (signal 0 doesn't kill, just checks)
-      process.kill(peer.pid, 0);
-    } catch {
-      // Process doesn't exist, remove it
+    if (!alivePids.has(peer.pid)) {
       db.run("DELETE FROM peer_groups WHERE peer_id = ?", [peer.id]);
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
     }
   }
-
 }
 
 // NOTE: initial cleanStalePeers() and setInterval are called after rateLimitMap is defined below
@@ -128,8 +237,8 @@ function cleanStalePeers() {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, registered_at, last_seen, group_id, git_branch)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateName = db.prepare(`
@@ -185,21 +294,6 @@ const selectSentMessages = db.prepare(`
   SELECT * FROM messages WHERE from_id = ? ORDER BY sent_at DESC LIMIT ?
 `);
 
-const joinGroup = db.prepare(`
-  INSERT OR IGNORE INTO peer_groups (peer_id, group_name, joined_at) VALUES (?, ?, ?)
-`);
-
-const leaveGroup = db.prepare(`
-  DELETE FROM peer_groups WHERE peer_id = ? AND group_name = ?
-`);
-
-const selectGroupMembers = db.prepare(`
-  SELECT p.* FROM peers p JOIN peer_groups pg ON p.id = pg.peer_id WHERE pg.group_name = ?
-`);
-
-const selectAllGroups = db.prepare(`
-  SELECT group_name, COUNT(*) as member_count FROM peer_groups GROUP BY group_name
-`);
 
 const selectRecentMessages = db.prepare(`
   SELECT * FROM messages ORDER BY sent_at DESC LIMIT ?
@@ -296,7 +390,7 @@ function validateBody(body: unknown): Record<string, unknown> {
   return body as Record<string, unknown>;
 }
 
-function validateRegisterRequest(raw: unknown): RegisterRequest {
+function validateRegisterRequest(raw: unknown): RegisterRequest & { git_branch?: string | null } {
   const b = validateBody(raw);
   return {
     pid: validateNumber(b.pid, "pid"),
@@ -304,6 +398,7 @@ function validateRegisterRequest(raw: unknown): RegisterRequest {
     git_root: validateOptionalString(b.git_root, "git_root"),
     tty: validateOptionalString(b.tty, "tty"),
     summary: typeof b.summary === "string" ? b.summary : "",
+    git_branch: typeof b.git_branch === "string" ? b.git_branch : null,
   };
 }
 
@@ -382,30 +477,6 @@ function validateCheckAcksRequest(raw: unknown): CheckAcksRequest {
   };
 }
 
-function validateJoinGroupRequest(raw: unknown): JoinGroupRequest {
-  const b = validateBody(raw);
-  return {
-    id: validateString(b.id, "id"),
-    group: validateString(b.group, "group"),
-  };
-}
-
-function validateLeaveGroupRequest(raw: unknown): LeaveGroupRequest {
-  const b = validateBody(raw);
-  return {
-    id: validateString(b.id, "id"),
-    group: validateString(b.group, "group"),
-  };
-}
-
-function validateSendToGroupRequest(raw: unknown): SendToGroupRequest {
-  const b = validateBody(raw);
-  return {
-    from_id: validateString(b.from_id, "from_id"),
-    group: validateString(b.group, "group"),
-    text: validateString(b.text, "text"),
-  };
-}
 
 function validateSetNameRequest(raw: unknown): SetNameRequest {
   const b = validateBody(raw);
@@ -448,36 +519,89 @@ function generateId(): string {
   return id;
 }
 
-// --- Auto-naming ---
+// --- Auto-naming (slot-based, reuses freed slots) ---
 
-function nextPeerName(): string {
-  const row = db.query("SELECT name FROM peers WHERE name LIKE 'claude-%' ORDER BY CAST(SUBSTR(name, 8) AS INTEGER) DESC LIMIT 1").get() as { name: string } | null;
-  if (!row) return "claude-1";
-  const num = parseInt(row.name.slice(7), 10);
-  return `claude-${(isNaN(num) ? 0 : num) + 1}`;
+function nextPeerName(groupId: string | null = null): string {
+  const groupCondition = groupId !== null
+    ? "AND group_id = ?"
+    : "AND group_id IS NULL";
+  const params = groupId !== null ? [groupId] : [];
+
+  const rows = db.query(
+    `SELECT CAST(SUBSTR(name, 8) AS INTEGER) AS num FROM peers
+     WHERE name LIKE 'claude-%' AND CAST(SUBSTR(name, 8) AS INTEGER) > 0
+     ${groupCondition}
+     ORDER BY num ASC`
+  ).all(...params) as { num: number }[];
+
+  let slot = 1;
+  for (const row of rows) {
+    if (row.num !== slot) break;
+    slot++;
+  }
+  return `claude-${slot}`;
+}
+
+// Virtual peers (dashboard UI, CLI) — not in the peers table but can send/receive messages
+const VIRTUAL_PEERS = new Set(["dashboard", "cli"]);
+
+// --- Group isolation helpers ---
+
+function getPeerGroupId(peerId: string): string | null | undefined {
+  // Returns null for lobby peers, undefined if peer not found
+  if (VIRTUAL_PEERS.has(peerId)) return null; // virtual peers are in lobby / bypass
+  const row = db.query("SELECT group_id FROM peers WHERE id = ?").get(peerId) as { group_id: string | null } | null;
+  if (!row) return undefined;
+  return row.group_id;
+}
+
+function canCommunicate(fromId: string, toId: string): boolean {
+  // Virtual peers (dashboard, cli) can communicate with anyone
+  if (VIRTUAL_PEERS.has(fromId) || VIRTUAL_PEERS.has(toId)) return true;
+  const fromGroup = getPeerGroupId(fromId);
+  const toGroup = getPeerGroupId(toId);
+  if (fromGroup === undefined || toGroup === undefined) return false;
+  // Both null (lobby) or both same group
+  return fromGroup === toGroup;
 }
 
 // --- Request handlers ---
 
-function handleRegister(body: RegisterRequest): RegisterResponse {
-  const id = generateId();
-  const name = nextPeerName();
+function handleRegister(body: RegisterRequest & { git_branch?: string | null }): RegisterResponse {
   const now = new Date().toISOString();
+  const branch = body.git_branch ?? null;
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Check for existing registration with this PID — preserve name and group
+  const existing = db.query("SELECT id, name, group_id FROM peers WHERE pid = ?")
+    .get(body.pid) as { id: string; name: string; group_id: string | null } | null;
+
+  let groupId = existing?.group_id ?? null;
+
+  // Auto-grouping by git branch: if peer has a branch and no existing group assignment,
+  // find or create an isolation group for that branch
+  if (branch && !existing?.group_id) {
+    const branchGroupName = `branch/${branch}`;
+    const existingGroup = db.query("SELECT id FROM isolation_groups WHERE name = ?").get(branchGroupName) as { id: string } | null;
+    if (existingGroup) {
+      groupId = existingGroup.id;
+    } else {
+      // Auto-create group for this branch
+      const gid = generateId();
+      db.run("INSERT INTO isolation_groups (id, name, created_at) VALUES (?, ?, ?)", [gid, branchGroupName, now]);
+      groupId = gid;
+    }
+  }
+
+  const name = existing ? existing.name : nextPeerName(groupId);
+
+  // Clean up old registration
   if (existing) {
     db.run("DELETE FROM peer_groups WHERE peer_id = ?", [existing.id]);
     deletePeer.run(existing.id);
   }
 
-  // Start a new session if no peers currently exist
-  const peerCount = (db.query("SELECT COUNT(*) as cnt FROM peers").get() as { cnt: number }).cnt;
-  if (peerCount === 0) {
-    currentSessionId = crypto.randomUUID();
-  }
-
-  insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  const id = generateId();
+  insertPeer.run(id, name, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now, groupId, branch);
   return { id, name };
 }
 
@@ -533,21 +657,24 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
+  // Group isolation: filter by requesting peer's group
+  if (body.exclude_id && !VIRTUAL_PEERS.has(body.exclude_id)) {
+    const requesterGroup = getPeerGroupId(body.exclude_id);
+    if (requesterGroup !== undefined) {
+      peers = peers.filter((p) => {
+        const pg = (p as any).group_id ?? null;
+        return pg === requesterGroup;
+      });
+    }
+  }
+
   // Verify each peer's process is still alive
   return peers.filter((p) => {
-    try {
-      process.kill(p.pid, 0);
-      return true;
-    } catch {
-      // Clean up dead peer
-      deletePeer.run(p.id);
-      return false;
-    }
+    if (isProcessAlive(p.pid)) return true;
+    deletePeer.run(p.id);
+    return false;
   });
 }
-
-// Virtual peers (dashboard UI, CLI) — not in the peers table but can receive messages
-const VIRTUAL_PEERS = new Set(["dashboard", "cli"]);
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
   // Rate limit per sender
@@ -565,6 +692,11 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
     if (!target) {
       return { ok: false, error: `Peer ${body.to_id} not found` };
+    }
+
+    // Group isolation check
+    if (!canCommunicate(body.from_id, body.to_id)) {
+      return { ok: false, error: "Cannot message peers in a different group" };
     }
 
     // Queue depth limit (only for real peers)
@@ -591,6 +723,7 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 
 function handleUnregister(body: { id: string }): void {
   db.run("DELETE FROM peer_groups WHERE peer_id = ?", [body.id]);
+  activeFilesMap.delete(body.id);
   deletePeer.run(body.id);
 }
 
@@ -633,43 +766,77 @@ function handleCheckAcks(body: CheckAcksRequest): CheckAcksResponse {
   return { messages };
 }
 
-function handleJoinGroup(body: JoinGroupRequest): { ok: boolean } {
-  joinGroup.run(body.id, body.group, new Date().toISOString());
+
+// --- Isolation group management ---
+
+function handleCreateIsolationGroup(body: { name: string }): { ok: boolean; id?: string; error?: string } {
+  const name = body.name.trim();
+  if (!name || name.length > 32) return { ok: false, error: "Group name must be 1-32 characters" };
+  if (!/^[a-zA-Z0-9_-]+$/.test(name)) return { ok: false, error: "Group name can only contain letters, numbers, hyphens, and underscores" };
+
+  const existing = db.query("SELECT id FROM isolation_groups WHERE name = ?").get(name);
+  if (existing) return { ok: false, error: `Group "${name}" already exists` };
+
+  const id = generateId();
+  db.run("INSERT INTO isolation_groups (id, name, created_at) VALUES (?, ?, ?)", [id, name, new Date().toISOString()]);
+  return { ok: true, id };
+}
+
+function handleAssignGroup(body: { peer_id: string; group_id: string | null }): { ok: boolean; error?: string } {
+  const peer = db.query("SELECT id, name, group_id FROM peers WHERE id = ?").get(body.peer_id) as { id: string; name: string; group_id: string | null } | null;
+  if (!peer) return { ok: false, error: "Peer not found" };
+
+  if (body.group_id !== null) {
+    const group = db.query("SELECT id FROM isolation_groups WHERE id = ?").get(body.group_id);
+    if (!group) return { ok: false, error: "Group not found" };
+  }
+
+  const oldGroupId = peer.group_id;
+
+  // Re-assign name within the new group's namespace — only for default claude-N names.
+  // Custom names (set via set_name) are preserved across group moves.
+  if (oldGroupId !== body.group_id && /^claude-\d+$/.test(peer.name)) {
+    // Temporarily clear name so nextPeerName doesn't see the old name as occupied in the new group
+    updateName.run("_reassigning", body.peer_id);
+    db.run("UPDATE peers SET group_id = ? WHERE id = ?", [body.group_id, body.peer_id]);
+    const newName = nextPeerName(body.group_id);
+    updateName.run(newName, body.peer_id);
+  } else {
+    db.run("UPDATE peers SET group_id = ? WHERE id = ?", [body.group_id, body.peer_id]);
+  }
+
   return { ok: true };
 }
 
-function handleLeaveGroup(body: LeaveGroupRequest): { ok: boolean } {
-  leaveGroup.run(body.id, body.group);
-  return { ok: true };
-}
+function handleDeleteIsolationGroup(body: { group_id: string }): { ok: boolean; error?: string } {
+  const group = db.query("SELECT id FROM isolation_groups WHERE id = ?").get(body.group_id);
+  if (!group) return { ok: false, error: "Group not found" };
 
-function handleSendToGroup(body: SendToGroupRequest): SendToGroupResponse {
-  if (isRateLimited(body.from_id)) {
-    return { ok: false, sent_to: 0, error: `Rate limited: max ${RATE_LIMIT_MAX} messages per minute` };
-  }
-  if (body.text.length > MAX_MESSAGE_SIZE) {
-    return { ok: false, sent_to: 0, error: `Message too large` };
-  }
-
-  const members = (selectGroupMembers.all(body.group) as Peer[]).filter((p) => {
-    if (p.id === body.from_id) return false;
-    try { process.kill(p.pid, 0); return true; } catch { deletePeer.run(p.id); return false; }
-  });
-
-  const now = new Date().toISOString();
-  const insertMany = db.transaction(() => {
-    for (const peer of members) {
-      insertMessage.run(body.from_id, peer.id, body.text, now, currentSessionId);
+  // Move all members back to lobby and rename them
+  const members = db.query("SELECT id, name FROM peers WHERE group_id = ?").all(body.group_id) as { id: string; name: string }[];
+  for (const m of members) {
+    if (/^claude-\d+$/.test(m.name)) {
+      updateName.run("_reassigning", m.id);
     }
-  });
-  insertMany();
+    db.run("UPDATE peers SET group_id = NULL WHERE id = ?", [m.id]);
+    if (/^claude-\d+$/.test(m.name)) {
+      const newName = nextPeerName(null);
+      updateName.run(newName, m.id);
+    }
+  }
 
-  return { ok: true, sent_to: members.length };
+  db.run("DELETE FROM isolation_groups WHERE id = ?", [body.group_id]);
+  return { ok: true };
 }
 
-function handleListGroups(): ListGroupsResponse {
-  const groups = selectAllGroups.all() as Array<{ group_name: string; member_count: number }>;
-  return { groups: groups.map((g) => ({ name: g.group_name, member_count: g.member_count })) };
+function handleListIsolationGroups(): { groups: Array<{ id: string; name: string; member_count: number; members: Array<{ id: string; name: string }> }> } {
+  const groups = db.query("SELECT id, name FROM isolation_groups ORDER BY created_at ASC").all() as Array<{ id: string; name: string }>;
+  return {
+    groups: groups.map((g) => {
+      const members = db.query("SELECT id, name FROM peers WHERE group_id = ?").all(g.id) as Array<{ id: string; name: string }>;
+      return { id: g.id, name: g.name, member_count: members.length, members };
+    }),
+  };
 }
 
 function handleSetStatus(body: SetStatusRequest): { ok: boolean } {
@@ -682,7 +849,157 @@ function handleSetTyping(body: { id: string }): { ok: boolean } {
   return { ok: true };
 }
 
+// --- Feature: Message Pinning ---
+
+function handlePinMessage(body: { message_id: number; pinned: boolean }): { ok: boolean; error?: string } {
+  const msg = db.query("SELECT id FROM messages WHERE id = ?").get(body.message_id) as { id: number } | null;
+  if (!msg) return { ok: false, error: "Message not found" };
+  db.run("UPDATE messages SET pinned = ? WHERE id = ?", [body.pinned ? 1 : 0, body.message_id]);
+  return { ok: true };
+}
+
+// --- Feature: Tasks ---
+
+function handleCreateTask(body: { title: string; description?: string; creator_id: string; assignee_id?: string; group_id?: string | null }): { ok: boolean; id?: string; error?: string } {
+  const title = body.title.trim();
+  if (!title) return { ok: false, error: "Title cannot be empty" };
+  if (title.length > 200) return { ok: false, error: "Title too long (max 200)" };
+
+  // If assignee specified, verify they exist and are in same group
+  if (body.assignee_id && !VIRTUAL_PEERS.has(body.assignee_id)) {
+    const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.assignee_id);
+    if (!target) return { ok: false, error: "Assignee not found" };
+    if (!VIRTUAL_PEERS.has(body.creator_id) && !canCommunicate(body.creator_id, body.assignee_id)) {
+      return { ok: false, error: "Cannot assign tasks to peers in a different group" };
+    }
+  }
+
+  // Determine group from creator
+  let groupId = body.group_id ?? null;
+  if (!groupId && !VIRTUAL_PEERS.has(body.creator_id)) {
+    groupId = getPeerGroupId(body.creator_id) ?? null;
+  }
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.run(
+    "INSERT INTO tasks (id, title, description, creator_id, assignee_id, group_id, status, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+    [id, title, body.description || "", body.creator_id, body.assignee_id || null, groupId, now, currentSessionId]
+  );
+
+  // If there's an assignee, send them a notification message
+  if (body.assignee_id) {
+    const creatorName = VIRTUAL_PEERS.has(body.creator_id)
+      ? body.creator_id
+      : ((db.query("SELECT name FROM peers WHERE id = ?").get(body.creator_id) as { name: string } | null)?.name || body.creator_id);
+    insertMessage.run(
+      body.creator_id, body.assignee_id,
+      `**Task assigned to you:** ${title}${body.description ? `\n${body.description}` : ""}`,
+      now, currentSessionId
+    );
+  }
+
+  return { ok: true, id };
+}
+
+function handleCompleteTask(body: { task_id: string; peer_id: string; result?: string }): { ok: boolean; error?: string } {
+  const task = db.query("SELECT * FROM tasks WHERE id = ?").get(body.task_id) as any;
+  if (!task) return { ok: false, error: "Task not found" };
+  if (task.status === "completed") return { ok: false, error: "Task already completed" };
+
+  const now = new Date().toISOString();
+  db.run(
+    "UPDATE tasks SET status = 'completed', result = ?, completed_at = ? WHERE id = ?",
+    [body.result || "", now, body.task_id]
+  );
+
+  // Notify the creator
+  if (task.creator_id && task.creator_id !== body.peer_id) {
+    const peerName = VIRTUAL_PEERS.has(body.peer_id)
+      ? body.peer_id
+      : ((db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as { name: string } | null)?.name || body.peer_id);
+    insertMessage.run(
+      body.peer_id, task.creator_id,
+      `**Task completed:** ${task.title}${body.result ? `\n**Result:** ${body.result}` : ""}`,
+      now, currentSessionId
+    );
+  }
+
+  return { ok: true };
+}
+
+function handleListTasks(body: { group_id?: string | null; peer_id?: string; status?: string }): { tasks: any[] } {
+  let query = "SELECT * FROM tasks WHERE session_id = ?";
+  const params: any[] = [currentSessionId];
+
+  if (body.group_id !== undefined) {
+    if (body.group_id === null) {
+      query += " AND group_id IS NULL";
+    } else {
+      query += " AND group_id = ?";
+      params.push(body.group_id);
+    }
+  }
+
+  if (body.peer_id) {
+    query += " AND (creator_id = ? OR assignee_id = ?)";
+    params.push(body.peer_id, body.peer_id);
+  }
+
+  if (body.status) {
+    query += " AND status = ?";
+    params.push(body.status);
+  }
+
+  query += " ORDER BY created_at DESC LIMIT 100";
+  return { tasks: db.query(query).all(...params) as any[] };
+}
+
+// --- Feature: Active Files (edit conflict detection) ---
+
+function handleSetActiveFiles(body: { id: string; files: string[] }): { ok: boolean; conflicts?: Array<{ file: string; peer_id: string; peer_name: string }> } {
+  const files = body.files.slice(0, 50); // cap at 50 files
+  activeFilesMap.set(body.id, { files, updated_at: Date.now() });
+
+  // Check for conflicts within same group
+  const myGroup = getPeerGroupId(body.id);
+  const conflicts: Array<{ file: string; peer_id: string; peer_name: string }> = [];
+  const now = Date.now();
+
+  for (const [peerId, data] of activeFilesMap) {
+    if (peerId === body.id) continue;
+    if (now - data.updated_at > ACTIVE_FILES_TIMEOUT_MS) { activeFilesMap.delete(peerId); continue; }
+
+    const peerGroup = getPeerGroupId(peerId);
+    if (myGroup !== peerGroup) continue; // different group, no conflict
+
+    for (const file of files) {
+      if (data.files.includes(file)) {
+        const peerRow = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+        conflicts.push({ file, peer_id: peerId, peer_name: peerRow?.name || peerId });
+      }
+    }
+  }
+
+  return { ok: true, conflicts: conflicts.length > 0 ? conflicts : undefined };
+}
+
+function getActiveFilesState(): Array<{ peer_id: string; peer_name: string; files: string[] }> {
+  const now = Date.now();
+  const result: Array<{ peer_id: string; peer_name: string; files: string[] }> = [];
+  for (const [peerId, data] of activeFilesMap) {
+    if (now - data.updated_at > ACTIVE_FILES_TIMEOUT_MS) { activeFilesMap.delete(peerId); continue; }
+    const peerRow = db.query("SELECT name FROM peers WHERE id = ?").get(peerId) as { name: string } | null;
+    result.push({ peer_id: peerId, peer_name: peerRow?.name || peerId, files: data.files });
+  }
+  return result;
+}
+
 function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryResponse {
+  // Enforce group isolation — peers in different groups cannot view each other's history
+  if (!canCommunicate(body.peer_a, body.peer_b)) {
+    return { messages: [] };
+  }
   const limit = body.limit ?? 50;
   const messages = selectMessageHistory.all(
     body.peer_a, body.peer_b, body.peer_b, body.peer_a, currentSessionId, limit
@@ -693,7 +1010,7 @@ function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryRespon
 function getDashboardState() {
   const peers = selectAllPeers.all() as Peer[];
   const messages = selectSessionMessages.all(currentSessionId) as Message[];
-  const groups = selectAllGroups.all() as Array<{ group_name: string; member_count: number }>;
+  const isolationGroups = handleListIsolationGroups().groups;
   // Build typing list (peers that signaled typing in last 5s)
   const now = Date.now();
   const typing: string[] = [];
@@ -702,11 +1019,18 @@ function getDashboardState() {
     else typingState.delete(id);
   }
 
+  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 100").all(currentSessionId) as any[];
+  const pinnedMessages = db.query("SELECT * FROM messages WHERE session_id = ? AND pinned = 1 ORDER BY sent_at ASC").all(currentSessionId) as Message[];
+  const activeFiles = getActiveFilesState();
+
   return {
     peers,
     messages,
-    groups: groups.map((g) => ({ name: g.group_name, member_count: g.member_count })),
+    groups: isolationGroups,
     typing,
+    tasks,
+    pinned: pinnedMessages,
+    active_files: activeFiles,
     session_id: currentSessionId,
     uptime_ms: Date.now() - BROKER_START_TIME,
   };
@@ -715,6 +1039,7 @@ function getDashboardState() {
 // --- Dashboard ---
 
 const DASHBOARD_PATH = new URL("./dashboard.html", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+const DASHBOARD_JS_PATH = new URL("./dashboard.js", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 
 // --- WebSocket clients for dashboard ---
 
@@ -749,6 +1074,9 @@ Bun.serve({
       }
       if (path === "/api/dashboard-state") {
         return Response.json(getDashboardState());
+      }
+      if (path === "/dashboard.js") {
+        return new Response(Bun.file(DASHBOARD_JS_PATH), { headers: { "Content-Type": "application/javascript" } });
       }
       // Serve dashboard HTML for root path
       return new Response(Bun.file(DASHBOARD_PATH), { headers: { "Content-Type": "text/html" } });
@@ -785,14 +1113,22 @@ Bun.serve({
           return Response.json(handleAckMessage(validateAckMessageRequest(body)));
         case "/check-acks":
           return Response.json(handleCheckAcks(validateCheckAcksRequest(body)));
-        case "/join-group":
-          return Response.json(handleJoinGroup(validateJoinGroupRequest(body)));
-        case "/leave-group":
-          return Response.json(handleLeaveGroup(validateLeaveGroupRequest(body)));
-        case "/send-to-group":
-          return Response.json(handleSendToGroup(validateSendToGroupRequest(body)));
-        case "/list-groups":
-          return Response.json(handleListGroups());
+        case "/create-group": {
+          const b = validateBody(body);
+          return Response.json(handleCreateIsolationGroup({ name: validateString(b.name, "name") }));
+        }
+        case "/assign-group": {
+          const b = validateBody(body);
+          const peerId = validateString(b.peer_id, "peer_id");
+          const groupId = b.group_id === null || b.group_id === undefined ? null : validateString(b.group_id, "group_id");
+          return Response.json(handleAssignGroup({ peer_id: peerId, group_id: groupId }));
+        }
+        case "/delete-group": {
+          const b = validateBody(body);
+          return Response.json(handleDeleteIsolationGroup({ group_id: validateString(b.group_id, "group_id") }));
+        }
+        case "/list-isolation-groups":
+          return Response.json(handleListIsolationGroups());
         case "/set-name":
           return Response.json(handleSetName(validateSetNameRequest(body)));
         case "/set-status":
@@ -801,6 +1137,44 @@ Bun.serve({
           return Response.json(handleSetTyping(validateSetTypingRequest(body)));
         case "/message-history":
           return Response.json(handleMessageHistory(validateMessageHistoryRequest(body)));
+        case "/pin-message": {
+          const b = validateBody(body);
+          return Response.json(handlePinMessage({
+            message_id: validateNumber(b.message_id, "message_id"),
+            pinned: b.pinned !== false,
+          }));
+        }
+        case "/create-task": {
+          const b = validateBody(body);
+          return Response.json(handleCreateTask({
+            title: validateString(b.title, "title"),
+            description: typeof b.description === "string" ? b.description : "",
+            creator_id: validateString(b.creator_id, "creator_id"),
+            assignee_id: typeof b.assignee_id === "string" ? b.assignee_id : undefined,
+            group_id: b.group_id === null ? null : typeof b.group_id === "string" ? b.group_id : undefined,
+          }));
+        }
+        case "/complete-task": {
+          const b = validateBody(body);
+          return Response.json(handleCompleteTask({
+            task_id: validateString(b.task_id, "task_id"),
+            peer_id: validateString(b.peer_id, "peer_id"),
+            result: typeof b.result === "string" ? b.result : undefined,
+          }));
+        }
+        case "/list-tasks": {
+          const b = validateBody(body);
+          return Response.json(handleListTasks({
+            group_id: b.group_id === null ? null : typeof b.group_id === "string" ? b.group_id : undefined,
+            peer_id: typeof b.peer_id === "string" ? b.peer_id : undefined,
+            status: typeof b.status === "string" ? b.status : undefined,
+          }));
+        }
+        case "/set-active-files": {
+          const b = validateBody(body);
+          const files = Array.isArray(b.files) ? b.files.filter((f: unknown) => typeof f === "string") : [];
+          return Response.json(handleSetActiveFiles({ id: validateString(b.id, "id"), files }));
+        }
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

@@ -62,7 +62,9 @@ switch (cmd) {
 
         console.log("\nPeers:");
         for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
+          const name = (p as any).name ? `${(p as any).name} ` : "";
+          const group = (p as any).group_id ? `[${(p as any).group_id}]` : "[lobby]";
+          console.log(`  ${name}${p.id}  ${group}  PID:${p.pid}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);
@@ -96,7 +98,9 @@ switch (cmd) {
         console.log("No peers registered.");
       } else {
         for (const p of peers) {
-          const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
+          const group = (p as any).group_id ? `[${(p as any).group_id}]` : "[lobby]";
+          const parts = [`${p.id}  ${group}  PID:${p.pid}  ${p.cwd}`];
+          if ((p as any).name) parts[0] = `${(p as any).name} (${p.id})  ${group}  PID:${p.pid}  ${p.cwd}`;
           if (p.summary) parts.push(`  Summary: ${p.summary}`);
           console.log(parts.join("\n"));
         }
@@ -206,12 +210,13 @@ switch (cmd) {
 
   case "groups": {
     try {
-      const result = await brokerFetch<{ groups: Array<{ name: string; member_count: number }> }>("/list-groups", {});
+      const result = await brokerFetch<{ groups: Array<{ id: string; name: string; member_count: number; members: Array<{ id: string; name: string }> }> }>("/list-isolation-groups", {});
       if (result.groups.length === 0) {
-        console.log("No groups exist yet.");
+        console.log("No isolation groups. All peers are in the lobby.");
       } else {
         for (const g of result.groups) {
-          console.log(`  ${g.name}  (${g.member_count} member(s))`);
+          const memberNames = g.members.map((m) => m.name || m.id).join(", ");
+          console.log(`  ${g.name} (${g.id})  ${g.member_count} member(s): ${memberNames || "none"}`);
         }
       }
     } catch {
@@ -246,7 +251,7 @@ switch (cmd) {
             lastMsgId = m.id;
           }
         }
-      } catch {}
+      } catch { }
     });
     ws.addEventListener("close", () => {
       console.log("Disconnected from broker.");
@@ -257,7 +262,7 @@ switch (cmd) {
       process.exit(1);
     });
     // Keep process alive
-    await new Promise(() => {});
+    await new Promise(() => { });
     break;
   }
 
