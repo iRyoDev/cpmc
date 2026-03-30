@@ -1299,6 +1299,15 @@ async function main() {
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  process.on("beforeExit", cleanup);
+  // Best-effort synchronous unregister on abrupt exit (Windows terminal close, etc.)
+  process.on("exit", () => {
+    if (myId) {
+      try {
+        const res = Bun.spawnSync(["bun", "-e", `fetch("${BROKER_URL}/unregister",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:"${myId}",broadcast_departure:true})}).catch(()=>{})`]);
+      } catch { /* best effort */ }
+    }
+  });
 }
 
 main().catch((e) => {

@@ -348,18 +348,27 @@ function getAlivePids(pidsToCheck: number[]): Set<number> {
   return alive;
 }
 
-// Clean up stale peers (PIDs that no longer exist)
+// Clean up stale peers (PIDs that no longer exist OR heartbeat expired)
+const STALE_PEER_TIMEOUT_MS = 45_000; // 3x heartbeat interval (15s)
+
 function cleanStalePeers() {
-  const peers = db.query("SELECT id, pid FROM peers").all() as { id: string; pid: number }[];
+  const peers = db.query("SELECT id, pid, last_seen FROM peers").all() as { id: string; pid: number; last_seen: string }[];
   if (peers.length === 0) return;
   const alivePids = getAlivePids(peers.map(p => p.pid));
+  const now = Date.now();
+  let removed = 0;
   for (const peer of peers) {
-    if (!alivePids.has(peer.pid)) {
-      db.run("DELETE FROM peer_groups WHERE peer_id = ?", [peer.id]);
+    const lastSeenAge = now - new Date(peer.last_seen).getTime();
+    // Remove if PID is dead OR if heartbeat is stale (>45s without heartbeat)
+    if (!alivePids.has(peer.pid) || lastSeenAge > STALE_PEER_TIMEOUT_MS) {
+      const peerInfo = db.query("SELECT name, group_id FROM peers WHERE id = ?").get(peer.id) as { name: string; group_id: string | null } | null;
       db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
       db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+      if (peerInfo) audit("peer.stale_cleanup", peer.id, peerInfo.name || peer.id, peerInfo.group_id);
+      removed++;
     }
   }
+  if (removed > 0 && typeof broadcastDashboard === "function") broadcastDashboard();
 }
 
 // NOTE: initial cleanStalePeers() and setInterval are called after rateLimitMap is defined below
@@ -494,7 +503,7 @@ setInterval(() => {
   }
   // Push updated state to dashboard clients
   if (typeof broadcastDashboard === "function") broadcastDashboard();
-}, 30_000);
+}, 15_000);
 
 // --- Input validation ---
 
