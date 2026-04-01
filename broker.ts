@@ -562,274 +562,39 @@ setInterval(() => {
   if (typeof broadcastDashboard === "function") broadcastDashboard();
 }, 15_000);
 
-// --- Input validation ---
+// --- Input validation (imported from broker/validate.ts) ---
 
-class ValidationError extends Error {
-  constructor(msg: string) {
-    super(msg);
-    this.name = "ValidationError";
-  }
-}
-
-function validateString(val: unknown, name: string): string {
-  if (typeof val !== "string" || val.length === 0)
-    throw new ValidationError(`'${name}' must be a non-empty string`);
-  return val;
-}
-
-function validateOptionalString(val: unknown, name: string): string | null {
-  if (val === null || val === undefined) return null;
-  if (typeof val !== "string")
-    throw new ValidationError(`'${name}' must be a string or null`);
-  return val;
-}
-
-function validateNumber(val: unknown, name: string): number {
-  if (typeof val !== "number" || !Number.isFinite(val))
-    throw new ValidationError(`'${name}' must be a finite number`);
-  return val;
-}
-
-function validateBody(body: unknown): Record<string, unknown> {
-  if (!body || typeof body !== "object")
-    throw new ValidationError("Invalid request body");
-  return body as Record<string, unknown>;
-}
-
-function validateRegisterRequest(raw: unknown): RegisterRequest & { git_branch?: string | null } {
-  const b = validateBody(raw);
-  return {
-    pid: validateNumber(b.pid, "pid"),
-    cwd: validateString(b.cwd, "cwd"),
-    git_root: validateOptionalString(b.git_root, "git_root"),
-    tty: validateOptionalString(b.tty, "tty"),
-    summary: typeof b.summary === "string" ? b.summary : "",
-    git_branch: typeof b.git_branch === "string" ? b.git_branch : null,
-  };
-}
-
-function validateHeartbeatRequest(raw: unknown): HeartbeatRequest {
-  const b = validateBody(raw);
-  return { id: validateString(b.id, "id") };
-}
-
-function validateSetSummaryRequest(raw: unknown): SetSummaryRequest {
-  const b = validateBody(raw);
-  return {
-    id: validateString(b.id, "id"),
-    summary: validateString(b.summary, "summary"),
-  };
-}
-
-function validateListPeersRequest(raw: unknown): ListPeersRequest {
-  const b = validateBody(raw);
-  const scope = b.scope;
-  if (scope !== "machine" && scope !== "directory" && scope !== "repo")
-    throw new ValidationError("'scope' must be 'machine', 'directory', or 'repo'");
-  return {
-    scope,
-    cwd: validateString(b.cwd, "cwd"),
-    git_root: validateOptionalString(b.git_root, "git_root"),
-    exclude_id: typeof b.exclude_id === "string" ? b.exclude_id : undefined,
-  };
-}
-
-function validateSendMessageRequest(raw: unknown): SendMessageRequest {
-  const b = validateBody(raw);
-  return {
-    from_id: validateString(b.from_id, "from_id"),
-    to_id: validateString(b.to_id, "to_id"),
-    text: validateString(b.text, "text"),
-  };
-}
-
-function validatePollMessagesRequest(raw: unknown): PollMessagesRequest {
-  const b = validateBody(raw);
-  return { id: validateString(b.id, "id") };
-}
-
-function validateUnregisterRequest(raw: unknown): { id: string } {
-  const b = validateBody(raw);
-  return { id: validateString(b.id, "id") };
-}
-
-function validateBroadcastRequest(raw: unknown): BroadcastRequest {
-  const b = validateBody(raw);
-  const scope = b.scope;
-  if (scope !== "machine" && scope !== "directory" && scope !== "repo")
-    throw new ValidationError("'scope' must be 'machine', 'directory', or 'repo'");
-  return {
-    from_id: validateString(b.from_id, "from_id"),
-    scope,
-    cwd: validateString(b.cwd, "cwd"),
-    git_root: validateOptionalString(b.git_root, "git_root"),
-    text: validateString(b.text, "text"),
-  };
-}
-
-function validateAckMessageRequest(raw: unknown): AckMessageRequest {
-  const b = validateBody(raw);
-  return {
-    id: validateString(b.id, "id"),
-    message_id: validateNumber(b.message_id, "message_id"),
-  };
-}
-
-function validateCheckAcksRequest(raw: unknown): CheckAcksRequest {
-  const b = validateBody(raw);
-  return {
-    from_id: validateString(b.from_id, "from_id"),
-    limit: typeof b.limit === "number" ? b.limit : undefined,
-  };
-}
-
-
-function validateSetNameRequest(raw: unknown): SetNameRequest {
-  const b = validateBody(raw);
-  return {
-    id: validateString(b.id, "id"),
-    name: validateString(b.name, "name"),
-  };
-}
-
-function validateSetStatusRequest(raw: unknown): SetStatusRequest {
-  const b = validateBody(raw);
-  const status = b.status;
-  if (status !== "online" && status !== "away" && status !== "busy" && status !== "idle")
-    throw new ValidationError("'status' must be 'online', 'away', 'busy', or 'idle'");
-  return { id: validateString(b.id, "id"), status };
-}
-
-function validateSetTypingRequest(raw: unknown): { id: string } {
-  const b = validateBody(raw);
-  return { id: validateString(b.id, "id") };
-}
-
-function validateMessageHistoryRequest(raw: unknown): MessageHistoryRequest {
-  const b = validateBody(raw);
-  return {
-    peer_a: validateString(b.peer_a, "peer_a"),
-    peer_b: validateString(b.peer_b, "peer_b"),
-    limit: typeof b.limit === "number" ? b.limit : undefined,
-  };
-}
-
-function validateOptionalStringArray(val: unknown, name: string): string[] | undefined {
-  if (val === null || val === undefined) return undefined;
-  if (!Array.isArray(val)) throw new ValidationError(`'${name}' must be an array`);
-  return val.filter((v: unknown) => typeof v === "string") as string[];
-}
-
-// --- Validators for newer endpoints ---
-
-function validateSendStructuredRequest(raw: unknown): {
-  from_id: string; to_id: string; msg_type: string;
-  context_snapshot?: string | null;
-  [key: string]: unknown;
-} {
-  const b = validateBody(raw);
-  const msgType = validateString(b.msg_type, "msg_type");
-  if (!STRUCTURED_MSG_TYPES.includes(msgType))
-    throw new ValidationError(`'msg_type' must be one of: ${STRUCTURED_MSG_TYPES.join(", ")}`);
-  return {
-    ...b,
-    from_id: validateString(b.from_id, "from_id"),
-    to_id: validateString(b.to_id, "to_id"),
-    msg_type: msgType,
-    context_snapshot: validateOptionalString(b.context_snapshot, "context_snapshot"),
-  };
-}
-
-function validatePostDecisionRequest(raw: unknown): { author_id: string; key: string; value: string; rationale: string; category?: string } {
-  const b = validateBody(raw);
-  return {
-    author_id: validateString(b.author_id, "author_id"),
-    key: validateString(b.key, "key"),
-    value: validateString(b.value, "value"),
-    rationale: validateString(b.rationale, "rationale"),
-    category: typeof b.category === "string" ? b.category : undefined,
-  };
-}
-
-function validateListDecisionsRequest(raw: unknown): { key?: string; category?: string; status?: string } {
-  const b = validateBody(raw);
-  return {
-    key: typeof b.key === "string" ? b.key : undefined,
-    category: typeof b.category === "string" ? b.category : undefined,
-    status: typeof b.status === "string" ? b.status : undefined,
-  };
-}
-
-function validateRevokeDecisionRequest(raw: unknown): { decision_id: string; peer_id: string } {
-  const b = validateBody(raw);
-  return {
-    decision_id: validateString(b.decision_id, "decision_id"),
-    peer_id: validateString(b.peer_id, "peer_id"),
-  };
-}
-
-function validateRequestVerificationRequest(raw: unknown): { requester_id: string; verifier_id: string; claim: string; evidence_needed: string; files_to_check?: string[] } {
-  const b = validateBody(raw);
-  return {
-    requester_id: validateString(b.requester_id, "requester_id"),
-    verifier_id: validateString(b.verifier_id, "verifier_id"),
-    claim: validateString(b.claim, "claim"),
-    evidence_needed: typeof b.evidence_needed === "string" ? b.evidence_needed : "",
-    files_to_check: validateOptionalStringArray(b.files_to_check, "files_to_check"),
-  };
-}
-
-function validateRespondVerificationRequest(raw: unknown): { verification_id: string; verifier_id: string; status: string; response: string; evidence?: string } {
-  const b = validateBody(raw);
-  const status = validateString(b.status, "status");
-  if (status !== "verified" && status !== "failed")
-    throw new ValidationError("'status' must be 'verified' or 'failed'");
-  return {
-    verification_id: validateString(b.verification_id, "verification_id"),
-    verifier_id: validateString(b.verifier_id, "verifier_id"),
-    status,
-    response: validateString(b.response, "response"),
-    evidence: typeof b.evidence === "string" ? b.evidence : undefined,
-  };
-}
-
-function validateListVerificationsRequest(raw: unknown): { peer_id?: string; status?: string } {
-  const b = validateBody(raw);
-  return {
-    peer_id: typeof b.peer_id === "string" ? b.peer_id : undefined,
-    status: typeof b.status === "string" ? b.status : undefined,
-  };
-}
-
-function validateCreateProposalRequest(raw: unknown): { author_id: string; title: string; description?: string; required_votes?: number } {
-  const b = validateBody(raw);
-  return {
-    author_id: validateString(b.author_id, "author_id"),
-    title: validateString(b.title, "title"),
-    description: typeof b.description === "string" ? b.description : undefined,
-    required_votes: typeof b.required_votes === "number" ? b.required_votes : undefined,
-  };
-}
-
-function validateVoteProposalRequest(raw: unknown): { proposal_id: string; voter_id: string; vote: string; reason?: string } {
-  const b = validateBody(raw);
-  const vote = validateString(b.vote, "vote");
-  if (vote !== "approve" && vote !== "reject")
-    throw new ValidationError("'vote' must be 'approve' or 'reject'");
-  return {
-    proposal_id: validateString(b.proposal_id, "proposal_id"),
-    voter_id: validateString(b.voter_id, "voter_id"),
-    vote,
-    reason: typeof b.reason === "string" ? b.reason : undefined,
-  };
-}
-
-function validateListProposalsRequest(raw: unknown): { status?: string } {
-  const b = validateBody(raw);
-  return {
-    status: typeof b.status === "string" ? b.status : undefined,
-  };
-}
+import {
+  ValidationError,
+  STRUCTURED_MSG_TYPES,
+  validateRegisterRequest,
+  validateHeartbeatRequest,
+  validateSetSummaryRequest,
+  validateListPeersRequest,
+  validateSendMessageRequest,
+  validatePollMessagesRequest,
+  validateUnregisterRequest,
+  validateBroadcastRequest,
+  validateAckMessageRequest,
+  validateCheckAcksRequest,
+  validateSetNameRequest,
+  validateSetStatusRequest,
+  validateSetTypingRequest,
+  validateMessageHistoryRequest,
+  validateSendStructuredRequest,
+  validatePostDecisionRequest,
+  validateListDecisionsRequest,
+  validateRevokeDecisionRequest,
+  validateRequestVerificationRequest,
+  validateRespondVerificationRequest,
+  validateListVerificationsRequest,
+  validateCreateProposalRequest,
+  validateVoteProposalRequest,
+  validateListProposalsRequest,
+  validateBody,
+  validateString,
+  validateNumber,
+} from "./broker/validate.ts";
 
 // --- Generate peer ID ---
 
@@ -1427,8 +1192,6 @@ function handleListApprovals(body: { peer_id?: string; status?: string }): { app
 }
 
 // --- Feature: Structured Messages ---
-
-const STRUCTURED_MSG_TYPES = ["question", "decision", "context_share", "review_request", "handoff"];
 
 function buildStructuredText(msgType: string, meta: any): string {
   switch (msgType) {
