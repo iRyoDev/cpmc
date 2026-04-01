@@ -32,7 +32,52 @@ import type {
   MessageHistoryResponse,
   Peer,
   Message,
+  Task,
+  Decision,
+  Verification,
+  ProposalVote,
 } from "./shared/types.ts";
+
+// DB row types not defined in shared/types.ts
+interface ProposalRow {
+  id: string;
+  author_id: string;
+  author_name: string;
+  title: string;
+  description: string;
+  required_votes: number;
+  status: "open" | "approved" | "rejected";
+  group_id: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  session_id: string;
+}
+
+interface ApprovalRow {
+  id: string;
+  requester_id: string;
+  approver_id: string;
+  action_description: string;
+  status: "pending" | "approved" | "rejected";
+  group_id: string | null;
+  created_at: string;
+  resolved_at: string | null;
+  session_id: string;
+}
+
+interface AuditLogRow {
+  id: number;
+  action: string;
+  actor_id: string;
+  actor_name: string;
+  details: string;
+  group_id: string | null;
+  created_at: string;
+}
+
+interface PeerNameRow { name: string }
+interface CountRow { cnt: number }
+interface VoteCountRow { c: number }
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${homedir()}/.claude-peers.db`;
@@ -70,16 +115,24 @@ db.run(`
   )
 `);
 
+// Schema migration helper — only swallows "duplicate column" errors, rethrows real failures
+function migrate(sql: string) {
+  try { db.run(sql); } catch (e) {
+    if (e instanceof Error && e.message.includes("duplicate column")) return;
+    throw e;
+  }
+}
+
 // Schema migrations
-try { db.run("ALTER TABLE messages ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
-try { db.run("ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
+migrate("ALTER TABLE messages ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0");
+migrate("ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''");
 
 // NOTE: peer_groups table removed — unused. The system uses isolation_groups + peers.group_id instead.
 
 // Schema migrations
-try { db.run("ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
-try { db.run("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'online'"); } catch { /* already exists */ }
-try { db.run("ALTER TABLE peers ADD COLUMN group_id TEXT DEFAULT NULL"); } catch { /* already exists */ }
+migrate("ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''");
+migrate("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'online'");
+migrate("ALTER TABLE peers ADD COLUMN group_id TEXT DEFAULT NULL");
 
 // Isolation groups table
 db.run(`
@@ -91,10 +144,10 @@ db.run(`
 `);
 
 // --- Feature: git branch tracking (auto-grouping) ---
-try { db.run("ALTER TABLE peers ADD COLUMN git_branch TEXT DEFAULT NULL"); } catch { /* already exists */ }
+migrate("ALTER TABLE peers ADD COLUMN git_branch TEXT DEFAULT NULL");
 
 // --- Feature: message pinning ---
-try { db.run("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
+migrate("ALTER TABLE messages ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0");
 
 // --- Feature: tasks ---
 db.run(`
@@ -156,9 +209,9 @@ db.run(`
 `);
 
 // --- Feature: structured messages + context snapshots ---
-try { db.run("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT NULL"); } catch { /* already exists */ }
-try { db.run("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL"); } catch { /* already exists */ }
-try { db.run("ALTER TABLE messages ADD COLUMN context_snapshot TEXT DEFAULT NULL"); } catch { /* already exists */ }
+migrate("ALTER TABLE messages ADD COLUMN msg_type TEXT DEFAULT NULL");
+migrate("ALTER TABLE messages ADD COLUMN metadata TEXT DEFAULT NULL");
+migrate("ALTER TABLE messages ADD COLUMN context_snapshot TEXT DEFAULT NULL");
 
 // --- Feature: decisions board ---
 db.run(`
@@ -274,14 +327,28 @@ function persistSessionId(id: string): void {
   db.run("INSERT OR REPLACE INTO kv (key, value) VALUES ('session_id', ?)", [id]);
 }
 
+// Track when the broker was last alive (survives restarts via kv table)
+const SESSION_RESET_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+function updateLastAlive(): void {
+  db.run("INSERT OR REPLACE INTO kv (key, value) VALUES ('last_alive', ?)", [new Date().toISOString()]);
+}
+
 // Determine if we should start a fresh session:
-// Only if there are zero peers AND no recent messages (last 5 minutes)
+// Only reset if the broker has been down for > 5 minutes (based on last_alive timestamp)
+// This prevents losing session continuity on fast restarts where peers reconnect quickly
 function shouldResetSession(): boolean {
+  const lastAliveRow = db.query("SELECT value FROM kv WHERE key = 'last_alive'").get() as { value: string } | null;
+  if (lastAliveRow) {
+    const downtime = Date.now() - new Date(lastAliveRow.value).getTime();
+    if (downtime < SESSION_RESET_THRESHOLD_MS) return false; // fast restart, keep session
+  }
+  // Broker was down a long time (or first-ever start) — check for stale state
   const peerCount = (db.query("SELECT COUNT(*) as cnt FROM peers").get() as { cnt: number }).cnt;
   if (peerCount > 0) return false;
   const recentMsg = db.query(
     "SELECT id FROM messages WHERE sent_at > ? LIMIT 1"
-  ).get(new Date(Date.now() - 5 * 60 * 1000).toISOString()) as { id: number } | null;
+  ).get(new Date(Date.now() - SESSION_RESET_THRESHOLD_MS).toISOString()) as { id: number } | null;
   return !recentMsg;
 }
 
@@ -292,6 +359,8 @@ if (shouldResetSession()) {
 } else {
   currentSessionId = loadOrCreateSessionId();
 }
+// Mark broker as alive on startup
+updateLastAlive();
 
 // Typing indicators (in-memory, not persisted)
 const typingState = new Map<string, number>();
@@ -465,19 +534,19 @@ const rateLimitMap = new Map<string, { count: number; windowStart: number }>();
 function isRateLimited(senderId: string): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(senderId);
-  if (!entry || now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+  if (!entry || now - entry.windowStart >= RATE_LIMIT_WINDOW_MS) {
     rateLimitMap.set(senderId, { count: 1, windowStart: now });
     return false;
   }
-  if (entry.count >= RATE_LIMIT_MAX) return true;
   entry.count++;
-  return false;
+  return entry.count > RATE_LIMIT_MAX;
 }
 
 // Now that rateLimitMap exists, run initial cleanup and start periodic cleanup
 cleanStalePeers();
 setInterval(() => {
   cleanStalePeers();
+  updateLastAlive(); // persist broker liveness for session continuity across restarts
   const now = Date.now();
   for (const [key, entry] of rateLimitMap) {
     if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) rateLimitMap.delete(key);
@@ -916,7 +985,7 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     const requesterGroup = getPeerGroupId(body.exclude_id);
     if (requesterGroup !== undefined) {
       peers = peers.filter((p) => {
-        const pg = (p as any).group_id ?? null;
+        const pg = p.group_id ?? null;
         return pg === requesterGroup;
       });
     }
@@ -1185,7 +1254,7 @@ function handleCreateTask(body: { title: string; description?: string; creator_i
 }
 
 function handleCompleteTask(body: { task_id: string; peer_id: string; result?: string }): { ok: boolean; error?: string } {
-  const task = db.query("SELECT * FROM tasks WHERE id = ?").get(body.task_id) as any;
+  const task = db.query("SELECT * FROM tasks WHERE id = ?").get(body.task_id) as Task | null;
   if (!task) return { ok: false, error: "Task not found" };
   if (task.status === "completed") return { ok: false, error: "Task already completed" };
 
@@ -1210,9 +1279,9 @@ function handleCompleteTask(body: { task_id: string; peer_id: string; result?: s
   return { ok: true };
 }
 
-function handleListTasks(body: { group_id?: string | null; peer_id?: string; status?: string }): { tasks: any[] } {
+function handleListTasks(body: { group_id?: string | null; peer_id?: string; status?: string }): { tasks: Task[] } {
   let query = "SELECT * FROM tasks WHERE session_id = ?";
-  const params: any[] = [currentSessionId];
+  const params: (string | number)[] = [currentSessionId];
 
   if (body.group_id !== undefined) {
     if (body.group_id === null) {
@@ -1234,7 +1303,7 @@ function handleListTasks(body: { group_id?: string | null; peer_id?: string; sta
   }
 
   query += " ORDER BY created_at DESC LIMIT 100";
-  return { tasks: db.query(query).all(...params) as any[] };
+  return { tasks: db.query(query).all(...params) as Task[] };
 }
 
 // --- Feature: Active Files (edit conflict detection) ---
@@ -1299,8 +1368,8 @@ function getReactionsForMessages(messageIds: number[]): Record<number, Array<{ e
   const placeholders = messageIds.map(() => "?").join(",");
   const rows = db.query(`SELECT r.message_id, r.emoji, r.peer_id, COALESCE(p.name, r.peer_id) as peer_name
     FROM reactions r LEFT JOIN peers p ON r.peer_id = p.id
-    WHERE r.message_id IN (${placeholders}) ORDER BY r.created_at ASC`).all(...messageIds) as any[];
-  const result: Record<number, any[]> = {};
+    WHERE r.message_id IN (${placeholders}) ORDER BY r.created_at ASC`).all(...messageIds) as Array<{ message_id: number; emoji: string; peer_id: string; peer_name: string }>;
+  const result: Record<number, Array<{ emoji: string; peer_id: string; peer_name: string }>> = {};
   for (const row of rows) {
     if (!result[row.message_id]) result[row.message_id] = [];
     result[row.message_id]!.push({ emoji: row.emoji, peer_id: row.peer_id, peer_name: row.peer_name });
@@ -1330,7 +1399,7 @@ function handleRequestApproval(body: { requester_id: string; approver_id: string
 }
 
 function handleRespondApproval(body: { approval_id: string; peer_id: string; approved: boolean; reason?: string }): { ok: boolean; error?: string } {
-  const approval = db.query("SELECT * FROM approvals WHERE id = ?").get(body.approval_id) as any;
+  const approval = db.query("SELECT * FROM approvals WHERE id = ?").get(body.approval_id) as ApprovalRow | null;
   if (!approval) return { ok: false, error: "Approval not found" };
   if (approval.status !== "pending") return { ok: false, error: `Already ${approval.status}` };
   if (approval.approver_id !== body.peer_id) return { ok: false, error: "Not the designated approver" };
@@ -1339,7 +1408,7 @@ function handleRespondApproval(body: { approval_id: string; peer_id: string; app
   db.run("UPDATE approvals SET status = ?, resolved_at = ? WHERE id = ?",
     [newStatus, new Date().toISOString(), body.approval_id]);
 
-  const approverName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as any)?.name || body.peer_id;
+  const approverName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.peer_id) as PeerNameRow | null)?.name || body.peer_id;
   const statusEmoji = body.approved ? "✅" : "❌";
   insertMessage.run(body.peer_id, approval.requester_id,
     `${statusEmoji} **Approval ${newStatus}:** ${approval.action_description}${body.reason ? `\n**Reason:** ${body.reason}` : ""}`,
@@ -1348,13 +1417,13 @@ function handleRespondApproval(body: { approval_id: string; peer_id: string; app
   return { ok: true };
 }
 
-function handleListApprovals(body: { peer_id?: string; status?: string }): { approvals: any[] } {
+function handleListApprovals(body: { peer_id?: string; status?: string }): { approvals: ApprovalRow[] } {
   let query = "SELECT * FROM approvals WHERE session_id = ?";
-  const params: any[] = [currentSessionId];
+  const params: (string | number)[] = [currentSessionId];
   if (body.peer_id) { query += " AND (requester_id = ? OR approver_id = ?)"; params.push(body.peer_id, body.peer_id); }
   if (body.status) { query += " AND status = ?"; params.push(body.status); }
   query += " ORDER BY created_at DESC LIMIT 50";
-  return { approvals: db.query(query).all(...params) as any[] };
+  return { approvals: db.query(query).all(...params) as ApprovalRow[] };
 }
 
 // --- Feature: Structured Messages ---
@@ -1470,19 +1539,19 @@ function handlePostDecision(body: { author_id: string; key: string; value: strin
   return { ok: true, id };
 }
 
-function handleListDecisions(body: { key?: string; category?: string; status?: string }): { decisions: any[] } {
+function handleListDecisions(body: { key?: string; category?: string; status?: string }): { decisions: Decision[] } {
   let query = "SELECT * FROM decisions WHERE session_id = ?";
-  const params: any[] = [currentSessionId];
+  const params: (string | number)[] = [currentSessionId];
   if (body.key) { query += " AND key = ?"; params.push(body.key); }
   if (body.category) { query += " AND category = ?"; params.push(body.category); }
   if (body.status) { query += " AND status = ?"; params.push(body.status); }
   else { query += " AND status = 'active'"; }
   query += " ORDER BY updated_at DESC LIMIT 50";
-  return { decisions: db.query(query).all(...params) as any[] };
+  return { decisions: db.query(query).all(...params) as Decision[] };
 }
 
 function handleRevokeDecision(body: { decision_id: string; peer_id: string }): { ok: boolean; error?: string } {
-  const dec = db.query("SELECT * FROM decisions WHERE id = ?").get(body.decision_id) as any;
+  const dec = db.query("SELECT * FROM decisions WHERE id = ?").get(body.decision_id) as Decision | null;
   if (!dec) return { ok: false, error: "Decision not found" };
   db.run("UPDATE decisions SET status = 'revoked', updated_at = ? WHERE id = ?", [new Date().toISOString(), body.decision_id]);
   audit("decision.revoke", body.peer_id, `Revoked: ${dec.key}`, dec.group_id);
@@ -1515,7 +1584,7 @@ function handleRequestVerification(body: { requester_id: string; verifier_id: st
     [id, body.requester_id, body.verifier_id, claim, evidenceNeeded, filesJson, groupId, now, currentSessionId]);
 
   // Notify verifier
-  const requesterName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.requester_id) as any)?.name || body.requester_id;
+  const requesterName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.requester_id) as PeerNameRow | null)?.name || body.requester_id;
   const filesStr = (body.files_to_check || []).length > 0 ? `\n**Files to check:** ${(body.files_to_check || []).join(", ")}` : "";
   insertMessage.run(body.requester_id, body.verifier_id,
     `**Verification requested**\n**Claim:** ${claim}\n**Evidence needed:** ${evidenceNeeded}${filesStr}\n\nVerification ID: \`${id}\`\nUse \`respond_verification\` with status verified/failed.`,
@@ -1526,7 +1595,7 @@ function handleRequestVerification(body: { requester_id: string; verifier_id: st
 }
 
 function handleRespondVerification(body: { verification_id: string; verifier_id: string; status: string; response: string; evidence?: string }): { ok: boolean; error?: string } {
-  const ver = db.query("SELECT * FROM verifications WHERE id = ?").get(body.verification_id) as any;
+  const ver = db.query("SELECT * FROM verifications WHERE id = ?").get(body.verification_id) as Verification | null;
   if (!ver) return { ok: false, error: "Verification not found" };
   if (ver.status !== "pending") return { ok: false, error: "Verification already resolved" };
   if (ver.verifier_id !== body.verifier_id && !VIRTUAL_PEERS.has(body.verifier_id)) return { ok: false, error: "Only the designated verifier can respond" };
@@ -1538,7 +1607,7 @@ function handleRespondVerification(body: { verification_id: string; verifier_id:
 
   // Notify requester
   const emoji = body.status === "verified" ? "✅" : "❌";
-  const verifierName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.verifier_id) as any)?.name || body.verifier_id;
+  const verifierName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.verifier_id) as PeerNameRow | null)?.name || body.verifier_id;
   insertMessage.run(body.verifier_id, ver.requester_id,
     `${emoji} **Verification ${body.status}**\n**Claim:** ${ver.claim}\n**Response:** ${body.response}${body.evidence ? `\n**Evidence:** ${body.evidence}` : ""}`,
     now, currentSessionId);
@@ -1547,13 +1616,13 @@ function handleRespondVerification(body: { verification_id: string; verifier_id:
   return { ok: true };
 }
 
-function handleListVerifications(body: { peer_id?: string; status?: string }): { verifications: any[] } {
+function handleListVerifications(body: { peer_id?: string; status?: string }): { verifications: Verification[] } {
   let query = "SELECT * FROM verifications WHERE session_id = ?";
-  const params: any[] = [currentSessionId];
+  const params: (string | number)[] = [currentSessionId];
   if (body.peer_id) { query += " AND (requester_id = ? OR verifier_id = ?)"; params.push(body.peer_id, body.peer_id); }
   if (body.status) { query += " AND status = ?"; params.push(body.status); }
   query += " ORDER BY created_at DESC LIMIT 30";
-  return { verifications: db.query(query).all(...params) as any[] };
+  return { verifications: db.query(query).all(...params) as Verification[] };
 }
 
 // --- Feature: Consensus Protocol ---
@@ -1592,7 +1661,7 @@ function handleCreateProposal(body: { author_id: string; title: string; descript
 }
 
 function handleVoteProposal(body: { proposal_id: string; voter_id: string; vote: string; reason?: string }): { ok: boolean; status?: string; error?: string } {
-  const proposal = db.query("SELECT * FROM proposals WHERE id = ?").get(body.proposal_id) as any;
+  const proposal = db.query("SELECT * FROM proposals WHERE id = ?").get(body.proposal_id) as ProposalRow | null;
   if (!proposal) return { ok: false, error: "Proposal not found" };
   if (proposal.status !== "open") return { ok: false, error: "Proposal is no longer open" };
   if (body.vote !== "approve" && body.vote !== "reject") return { ok: false, error: "Vote must be approve or reject" };
@@ -1608,8 +1677,8 @@ function handleVoteProposal(body: { proposal_id: string; voter_id: string; vote:
     [voteId, body.proposal_id, body.voter_id, voterName, body.vote, body.reason || "", now]);
 
   // Check for auto-resolve
-  const approves = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'approve'").get(body.proposal_id) as any).c;
-  const rejects = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'reject'").get(body.proposal_id) as any).c;
+  const approves = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'approve'").get(body.proposal_id) as VoteCountRow).c;
+  const rejects = (db.query("SELECT COUNT(*) as c FROM proposal_votes WHERE proposal_id = ? AND vote = 'reject'").get(body.proposal_id) as VoteCountRow).c;
 
   let newStatus = "open";
   if (approves >= proposal.required_votes) {
@@ -1627,26 +1696,26 @@ function handleVoteProposal(body: { proposal_id: string; voter_id: string; vote:
 }
 
 // Batch-fetch votes for a list of proposals (avoids N+1)
-function attachVotesToProposals(proposals: any[]): any[] {
-  if (proposals.length === 0) return proposals;
-  const ids = proposals.map((p: any) => p.id);
+function attachVotesToProposals(proposals: ProposalRow[]): Array<ProposalRow & { votes: ProposalVote[] }> {
+  if (proposals.length === 0) return proposals.map(p => ({ ...p, votes: [] }));
+  const ids = proposals.map(p => p.id);
   const placeholders = ids.map(() => "?").join(",");
-  const allVotes = db.query(`SELECT * FROM proposal_votes WHERE proposal_id IN (${placeholders}) ORDER BY created_at ASC`).all(...ids) as any[];
-  const votesByProposal = new Map<string, any[]>();
+  const allVotes = db.query(`SELECT * FROM proposal_votes WHERE proposal_id IN (${placeholders}) ORDER BY created_at ASC`).all(...ids) as ProposalVote[];
+  const votesByProposal = new Map<string, ProposalVote[]>();
   for (const v of allVotes) {
     let arr = votesByProposal.get(v.proposal_id);
     if (!arr) { arr = []; votesByProposal.set(v.proposal_id, arr); }
     arr.push(v);
   }
-  return proposals.map((p: any) => ({ ...p, votes: votesByProposal.get(p.id) || [] }));
+  return proposals.map(p => ({ ...p, votes: votesByProposal.get(p.id) || [] }));
 }
 
-function handleListProposals(body: { status?: string }): { proposals: any[] } {
+function handleListProposals(body: { status?: string }): { proposals: Array<ProposalRow & { votes: ProposalVote[] }> } {
   let query = "SELECT * FROM proposals WHERE session_id = ?";
-  const params: any[] = [currentSessionId];
+  const params: (string | number)[] = [currentSessionId];
   if (body.status) { query += " AND status = ?"; params.push(body.status); }
   query += " ORDER BY created_at DESC LIMIT 20";
-  const proposals = db.query(query).all(...params) as any[];
+  const proposals = db.query(query).all(...params) as ProposalRow[];
   return { proposals: attachVotesToProposals(proposals) };
 }
 
@@ -1655,10 +1724,10 @@ function handleListProposals(body: { status?: string }): { proposals: any[] } {
 function handleSessionReport(): { report: string } {
   const peers = selectAllPeers.all() as Peer[];
   const messages = db.query("SELECT * FROM messages WHERE session_id = ? ORDER BY sent_at ASC").all(currentSessionId) as Message[];
-  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as any[];
-  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as any[];
-  const groups = db.query("SELECT id, name FROM isolation_groups").all() as any[];
-  const auditRows = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200").all() as any[];
+  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as Task[];
+  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at ASC").all(currentSessionId) as ApprovalRow[];
+  const groups = db.query("SELECT id, name FROM isolation_groups").all() as Array<{ id: string; name: string }>;
+  const auditRows = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 200").all() as AuditLogRow[];
 
   // Build name map
   const nm: Record<string, string> = { dashboard: "Dashboard", cli: "CLI" };
@@ -1679,7 +1748,7 @@ function handleSessionReport(): { report: string } {
   // Participants
   md += `## Participants\n\n`;
   for (const p of peers) {
-    const groupName = p.group_id ? (groups.find((g: any) => g.id === p.group_id)?.name || "Unknown") : "Lobby";
+    const groupName = p.group_id ? (groups.find(g => g.id === p.group_id)?.name || "Unknown") : "Lobby";
     md += `- **${p.name || p.id}** — ${p.cwd} (${groupName})${p.summary ? ` — *${p.summary}*` : ""}\n`;
   }
 
@@ -1687,7 +1756,7 @@ function handleSessionReport(): { report: string } {
   if (groups.length > 0) {
     md += `\n## Groups\n\n`;
     for (const g of groups) {
-      const members = peers.filter(p => (p as any).group_id === g.id);
+      const members = peers.filter(p => p.group_id === g.id);
       md += `- **${g.name}**: ${members.map(m => m.name || m.id).join(", ") || "empty"}\n`;
     }
   }
@@ -1741,9 +1810,9 @@ function handleSessionReport(): { report: string } {
 
 // --- Feature: Audit Log query ---
 
-function handleGetAuditLog(body: { limit?: number }): { entries: any[] } {
+function handleGetAuditLog(body: { limit?: number }): { entries: AuditLogRow[] } {
   const limit = body.limit ?? 50;
-  return { entries: db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?").all(limit) as any[] };
+  return { entries: db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?").all(limit) as AuditLogRow[] };
 }
 
 function handleMessageHistory(body: MessageHistoryRequest): MessageHistoryResponse {
@@ -1770,20 +1839,20 @@ function getDashboardState() {
     else typingState.delete(id);
   }
 
-  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 100").all(currentSessionId) as any[];
+  const tasks = db.query("SELECT * FROM tasks WHERE session_id = ? ORDER BY created_at DESC LIMIT 100").all(currentSessionId) as Task[];
   const pinnedMessages = db.query("SELECT * FROM messages WHERE session_id = ? AND pinned = 1 ORDER BY sent_at ASC").all(currentSessionId) as Message[];
   const activeFiles = getActiveFilesState();
-  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as any[];
-  const recentAudit = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 15").all() as any[];
+  const approvals = db.query("SELECT * FROM approvals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as ApprovalRow[];
+  const recentAudit = db.query("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 15").all() as AuditLogRow[];
 
   // Gather reactions for displayed messages
   const msgIds = messages.map((m: Message) => m.id);
   const reactions = getReactionsForMessages(msgIds);
 
   // New features: decisions, verifications, proposals
-  const decisions = db.query("SELECT * FROM decisions WHERE session_id = ? ORDER BY updated_at DESC LIMIT 50").all(currentSessionId) as any[];
-  const verifications = db.query("SELECT * FROM verifications WHERE session_id = ? ORDER BY created_at DESC LIMIT 30").all(currentSessionId) as any[];
-  const proposalsRaw = db.query("SELECT * FROM proposals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as any[];
+  const decisions = db.query("SELECT * FROM decisions WHERE session_id = ? ORDER BY updated_at DESC LIMIT 50").all(currentSessionId) as Decision[];
+  const verifications = db.query("SELECT * FROM verifications WHERE session_id = ? ORDER BY created_at DESC LIMIT 30").all(currentSessionId) as Verification[];
+  const proposalsRaw = db.query("SELECT * FROM proposals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as ProposalRow[];
   const proposals = attachVotesToProposals(proposalsRaw);
 
   return {
@@ -1809,6 +1878,10 @@ function getDashboardState() {
 
 const DASHBOARD_PATH = new URL("./dashboard.html", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 const DASHBOARD_JS_PATH = new URL("./dashboard.js", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
+
+// Pre-compute ETags from file mtimes at startup (invalidates on broker restart / file change)
+const dashboardHtmlEtag = `"${Bun.file(DASHBOARD_PATH).lastModified}"`;
+const dashboardJsEtag = `"${Bun.file(DASHBOARD_JS_PATH).lastModified}"`;
 
 // --- WebSocket clients for dashboard ---
 
@@ -1855,10 +1928,20 @@ Bun.serve({
         return Response.json(getDashboardState());
       }
       if (path === "/dashboard.js") {
-        return new Response(Bun.file(DASHBOARD_JS_PATH), { headers: { "Content-Type": "application/javascript" } });
+        if (req.headers.get("if-none-match") === dashboardJsEtag) {
+          return new Response(null, { status: 304 });
+        }
+        return new Response(Bun.file(DASHBOARD_JS_PATH), {
+          headers: { "Content-Type": "application/javascript", "Cache-Control": "public, max-age=3600", "ETag": dashboardJsEtag },
+        });
       }
       // Serve dashboard HTML for root path
-      return new Response(Bun.file(DASHBOARD_PATH), { headers: { "Content-Type": "text/html" } });
+      if (req.headers.get("if-none-match") === dashboardHtmlEtag) {
+        return new Response(null, { status: 304 });
+      }
+      return new Response(Bun.file(DASHBOARD_PATH), {
+        headers: { "Content-Type": "text/html", "Cache-Control": "public, max-age=3600", "ETag": dashboardHtmlEtag },
+      });
     }
 
     if (req.method !== "POST") {
