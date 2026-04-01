@@ -74,15 +74,7 @@ db.run(`
 try { db.run("ALTER TABLE messages ADD COLUMN acknowledged INTEGER NOT NULL DEFAULT 0"); } catch { /* already exists */ }
 try { db.run("ALTER TABLE peers ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
 
-db.run(`
-  CREATE TABLE IF NOT EXISTS peer_groups (
-    peer_id TEXT NOT NULL,
-    group_name TEXT NOT NULL,
-    joined_at TEXT NOT NULL,
-    PRIMARY KEY (peer_id, group_name),
-    FOREIGN KEY (peer_id) REFERENCES peers(id)
-  )
-`);
+// NOTE: peer_groups table removed — unused. The system uses isolation_groups + peers.group_id instead.
 
 // Schema migrations
 try { db.run("ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"); } catch { /* already exists */ }
@@ -444,10 +436,6 @@ const selectSentMessages = db.prepare(`
 `);
 
 
-const selectRecentMessages = db.prepare(`
-  SELECT * FROM messages ORDER BY sent_at DESC LIMIT ?
-`);
-
 const selectSessionMessages = db.prepare(`
   SELECT * FROM messages WHERE session_id = ? ORDER BY sent_at ASC LIMIT 200
 `);
@@ -468,7 +456,7 @@ const updateStatus = db.prepare(`
 const MAX_MESSAGE_SIZE = 65_536; // 64 KB
 const MAX_QUEUE_DEPTH = 100;
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
-const RATE_LIMIT_MAX = 10; // max messages per window per sender
+const RATE_LIMIT_MAX = 60; // max messages per window per sender
 
 // --- Rate limiting ---
 
@@ -745,7 +733,6 @@ function handleRegister(body: RegisterRequest & { git_branch?: string | null }):
 
   // Clean up old registration
   if (existing) {
-    db.run("DELETE FROM peer_groups WHERE peer_id = ?", [existing.id]);
     deletePeer.run(existing.id);
   }
 
@@ -818,9 +805,10 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     }
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer's process is still alive (batched for performance)
+  const alivePids = getAlivePids(peers.map(p => p.pid));
   return peers.filter((p) => {
-    if (isProcessAlive(p.pid)) return true;
+    if (alivePids.has(p.pid)) return true;
     deletePeer.run(p.id);
     return false;
   });
@@ -892,7 +880,6 @@ function handleUnregister(body: { id: string; broadcast_departure?: boolean }): 
     }
   }
 
-  db.run("DELETE FROM peer_groups WHERE peer_id = ?", [body.id]);
   activeFilesMap.delete(body.id);
   deletePeer.run(body.id);
 }
@@ -1001,9 +988,17 @@ function handleDeleteIsolationGroup(body: { group_id: string }): { ok: boolean; 
 
 function handleListIsolationGroups(): { groups: Array<{ id: string; name: string; member_count: number; members: Array<{ id: string; name: string }> }> } {
   const groups = db.query("SELECT id, name FROM isolation_groups ORDER BY created_at ASC").all() as Array<{ id: string; name: string }>;
+  // Batch-fetch all grouped peers instead of N+1 queries
+  const allGroupedPeers = db.query("SELECT id, name, group_id FROM peers WHERE group_id IS NOT NULL").all() as Array<{ id: string; name: string; group_id: string }>;
+  const membersByGroup = new Map<string, Array<{ id: string; name: string }>>();
+  for (const p of allGroupedPeers) {
+    let arr = membersByGroup.get(p.group_id);
+    if (!arr) { arr = []; membersByGroup.set(p.group_id, arr); }
+    arr.push({ id: p.id, name: p.name });
+  }
   return {
     groups: groups.map((g) => {
-      const members = db.query("SELECT id, name FROM peers WHERE group_id = ?").all(g.id) as Array<{ id: string; name: string }>;
+      const members = membersByGroup.get(g.id) || [];
       return { id: g.id, name: g.name, member_count: members.length, members };
     }),
   };
@@ -1210,7 +1205,6 @@ function handleRequestApproval(body: { requester_id: string; approver_id: string
     [id, body.requester_id, body.approver_id, body.action_description, groupId, now, currentSessionId]
   );
   // Send notification to approver
-  const requesterName = (db.query("SELECT name FROM peers WHERE id = ?").get(body.requester_id) as any)?.name || body.requester_id;
   insertMessage.run(body.requester_id, body.approver_id,
     `**Approval requested:** ${body.action_description}\n\nApproval ID: \`${id}\`\nUse \`respond_approval\` to accept or reject.`,
     now, currentSessionId);
@@ -1518,18 +1512,28 @@ function handleVoteProposal(body: { proposal_id: string; voter_id: string; vote:
   return { ok: true, status: newStatus };
 }
 
+// Batch-fetch votes for a list of proposals (avoids N+1)
+function attachVotesToProposals(proposals: any[]): any[] {
+  if (proposals.length === 0) return proposals;
+  const ids = proposals.map((p: any) => p.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const allVotes = db.query(`SELECT * FROM proposal_votes WHERE proposal_id IN (${placeholders}) ORDER BY created_at ASC`).all(...ids) as any[];
+  const votesByProposal = new Map<string, any[]>();
+  for (const v of allVotes) {
+    let arr = votesByProposal.get(v.proposal_id);
+    if (!arr) { arr = []; votesByProposal.set(v.proposal_id, arr); }
+    arr.push(v);
+  }
+  return proposals.map((p: any) => ({ ...p, votes: votesByProposal.get(p.id) || [] }));
+}
+
 function handleListProposals(body: { status?: string }): { proposals: any[] } {
   let query = "SELECT * FROM proposals WHERE session_id = ?";
   const params: any[] = [currentSessionId];
   if (body.status) { query += " AND status = ?"; params.push(body.status); }
   query += " ORDER BY created_at DESC LIMIT 20";
   const proposals = db.query(query).all(...params) as any[];
-  return {
-    proposals: proposals.map((p: any) => ({
-      ...p,
-      votes: db.query("SELECT * FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(p.id) as any[],
-    })),
-  };
+  return { proposals: attachVotesToProposals(proposals) };
 }
 
 // --- Feature: Session Report ---
@@ -1666,10 +1670,7 @@ function getDashboardState() {
   const decisions = db.query("SELECT * FROM decisions WHERE session_id = ? ORDER BY updated_at DESC LIMIT 50").all(currentSessionId) as any[];
   const verifications = db.query("SELECT * FROM verifications WHERE session_id = ? ORDER BY created_at DESC LIMIT 30").all(currentSessionId) as any[];
   const proposalsRaw = db.query("SELECT * FROM proposals WHERE session_id = ? ORDER BY created_at DESC LIMIT 20").all(currentSessionId) as any[];
-  const proposals = proposalsRaw.map((p: any) => ({
-    ...p,
-    votes: db.query("SELECT * FROM proposal_votes WHERE proposal_id = ? ORDER BY created_at ASC").all(p.id) as any[],
-  }));
+  const proposals = attachVotesToProposals(proposalsRaw);
 
   return {
     peers,
@@ -1699,19 +1700,28 @@ const DASHBOARD_JS_PATH = new URL("./dashboard.js", import.meta.url).pathname.re
 
 const dashboardClients = new Set<any>();
 
+// Debounced dashboard broadcast — coalesces rapid updates into a single push
+let dashboardBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+const DASHBOARD_DEBOUNCE_MS = 200;
+
 function broadcastDashboard() {
   if (dashboardClients.size === 0) return;
-  const state = JSON.stringify(getDashboardState());
-  for (const ws of dashboardClients) {
-    try { ws.send(state); } catch { dashboardClients.delete(ws); }
-  }
+  if (dashboardBroadcastTimer) return; // already scheduled
+  dashboardBroadcastTimer = setTimeout(() => {
+    dashboardBroadcastTimer = null;
+    if (dashboardClients.size === 0) return;
+    const state = JSON.stringify(getDashboardState());
+    for (const ws of dashboardClients) {
+      try { ws.send(state); } catch { dashboardClients.delete(ws); }
+    }
+  }, DASHBOARD_DEBOUNCE_MS);
 }
 
 // --- HTTP Server ---
 
 Bun.serve({
   port: PORT,
-  hostname: "0.0.0.0",
+  hostname: "127.0.0.1",
   async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
@@ -1724,7 +1734,8 @@ Bun.serve({
 
     if (req.method === "GET") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        const peerCount = (db.query("SELECT COUNT(*) as cnt FROM peers").get() as { cnt: number }).cnt;
+        return Response.json({ status: "ok", peers: peerCount });
       }
       if (path === "/api/dashboard-state") {
         return Response.json(getDashboardState());
@@ -1880,7 +1891,7 @@ Bun.serve({
         case "/post-decision":
           return Response.json(handlePostDecision(body as any));
         case "/list-decisions":
-          return Response.json(handleListDecisions(body as any || {}));
+          return Response.json(handleListDecisions(body as any));
         case "/revoke-decision":
           return Response.json(handleRevokeDecision(body as any));
 
@@ -1890,7 +1901,7 @@ Bun.serve({
         case "/respond-verification":
           return Response.json(handleRespondVerification(body as any));
         case "/list-verifications":
-          return Response.json(handleListVerifications(body as any || {}));
+          return Response.json(handleListVerifications(body as any));
 
         // --- Consensus Protocol ---
         case "/create-proposal":
@@ -1898,7 +1909,7 @@ Bun.serve({
         case "/vote-proposal":
           return Response.json(handleVoteProposal(body as any));
         case "/list-proposals":
-          return Response.json(handleListProposals(body as any || {}));
+          return Response.json(handleListProposals(body as any));
 
         default:
           return Response.json({ error: "not found" }, { status: 404 });
@@ -1908,8 +1919,13 @@ Bun.serve({
       const msg = e instanceof Error ? e.message : String(e);
       return Response.json({ error: msg }, { status: isValidation ? 400 : 500 });
     } finally {
-      // Push state to all dashboard WebSocket clients after any POST
-      if (req.method === "POST") broadcastDashboard();
+      // Push state to dashboard clients after state-changing POSTs (skip heartbeats & read-only queries)
+      const skipBroadcast = path === "/heartbeat" || path === "/poll-messages" || path === "/check-acks"
+        || path === "/list-peers" || path === "/list-tasks" || path === "/list-approvals"
+        || path === "/list-decisions" || path === "/list-verifications" || path === "/list-proposals"
+        || path === "/list-isolation-groups" || path === "/message-history" || path === "/audit-log"
+        || path === "/session-report";
+      if (req.method === "POST" && !skipBroadcast) broadcastDashboard();
     }
   },
   websocket: {

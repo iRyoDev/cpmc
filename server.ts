@@ -28,7 +28,7 @@ import type {
   BroadcastResponse,
 } from "./shared/types.ts";
 import { createLogger } from "./shared/log.ts";
-import { getRecentFiles } from "./shared/summarize.ts";
+import { getGitBranch, getRecentFiles } from "./shared/summarize.ts";
 
 // --- Configuration ---
 
@@ -110,23 +110,6 @@ async function getGitRoot(cwd: string): Promise<string | null> {
   } catch {
     // not a git repo
   }
-  return null;
-}
-
-async function getGitBranch(cwd: string): Promise<string | null> {
-  try {
-    const proc = Bun.spawn(["git", "rev-parse", "--abbrev-ref", "HEAD"], {
-      cwd,
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-    const text = await new Response(proc.stdout).text();
-    const code = await proc.exited;
-    if (code === 0) {
-      const branch = text.trim();
-      return branch === "HEAD" ? null : branch; // detached HEAD
-    }
-  } catch { /* not a git repo */ }
   return null;
 }
 
@@ -1267,10 +1250,10 @@ async function main() {
   await mcp.connect(new StdioServerTransport());
   log.info("MCP connected");
 
-  // 6. Start polling for inbound messages
+  // 5. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat (also detects broker death)
+  // 6. Start heartbeat (also detects broker death)
   const heartbeatTimer = setInterval(async () => {
     if (!myId || reconnectPromise) return;
     try {
@@ -1282,7 +1265,7 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
-  // 8. Clean up on exit
+  // 7. Clean up on exit
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
@@ -1304,7 +1287,7 @@ async function main() {
   process.on("exit", () => {
     if (myId) {
       try {
-        const res = Bun.spawnSync(["bun", "-e", `fetch("${BROKER_URL}/unregister",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:"${myId}",broadcast_departure:true})}).catch(()=>{})`]);
+        Bun.spawnSync(["bun", "-e", `fetch("${BROKER_URL}/unregister",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:"${myId}",broadcast_departure:true})}).catch(()=>{})`]);
       } catch { /* best effort */ }
     }
   });

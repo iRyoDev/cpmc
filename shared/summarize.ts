@@ -11,7 +11,8 @@ export async function getGitBranch(cwd: string): Promise<string | null> {
     const text = await new Response(proc.stdout).text();
     const code = await proc.exited;
     if (code === 0) {
-      return text.trim();
+      const branch = text.trim();
+      return branch === "HEAD" ? null : branch; // detached HEAD → null
     }
   } catch {
     // not a git repo
