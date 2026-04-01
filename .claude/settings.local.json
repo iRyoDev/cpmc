@@ -13,5 +13,8 @@
       "Bash(bun build:*)",
       "Bash(bun test:*)"
     ]
+  },
+  "enabledPlugins": {
+    "vercel": false
   }
 }
