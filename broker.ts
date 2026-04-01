@@ -645,6 +645,123 @@ function validateMessageHistoryRequest(raw: unknown): MessageHistoryRequest {
   };
 }
 
+function validateOptionalStringArray(val: unknown, name: string): string[] | undefined {
+  if (val === null || val === undefined) return undefined;
+  if (!Array.isArray(val)) throw new ValidationError(`'${name}' must be an array`);
+  return val.filter((v: unknown) => typeof v === "string") as string[];
+}
+
+// --- Validators for newer endpoints ---
+
+function validateSendStructuredRequest(raw: unknown): {
+  from_id: string; to_id: string; msg_type: string;
+  context_snapshot?: string | null;
+  [key: string]: unknown;
+} {
+  const b = validateBody(raw);
+  const msgType = validateString(b.msg_type, "msg_type");
+  if (!STRUCTURED_MSG_TYPES.includes(msgType))
+    throw new ValidationError(`'msg_type' must be one of: ${STRUCTURED_MSG_TYPES.join(", ")}`);
+  return {
+    ...b,
+    from_id: validateString(b.from_id, "from_id"),
+    to_id: validateString(b.to_id, "to_id"),
+    msg_type: msgType,
+    context_snapshot: validateOptionalString(b.context_snapshot, "context_snapshot"),
+  };
+}
+
+function validatePostDecisionRequest(raw: unknown): { author_id: string; key: string; value: string; rationale: string; category?: string } {
+  const b = validateBody(raw);
+  return {
+    author_id: validateString(b.author_id, "author_id"),
+    key: validateString(b.key, "key"),
+    value: validateString(b.value, "value"),
+    rationale: validateString(b.rationale, "rationale"),
+    category: typeof b.category === "string" ? b.category : undefined,
+  };
+}
+
+function validateListDecisionsRequest(raw: unknown): { key?: string; category?: string; status?: string } {
+  const b = validateBody(raw);
+  return {
+    key: typeof b.key === "string" ? b.key : undefined,
+    category: typeof b.category === "string" ? b.category : undefined,
+    status: typeof b.status === "string" ? b.status : undefined,
+  };
+}
+
+function validateRevokeDecisionRequest(raw: unknown): { decision_id: string; peer_id: string } {
+  const b = validateBody(raw);
+  return {
+    decision_id: validateString(b.decision_id, "decision_id"),
+    peer_id: validateString(b.peer_id, "peer_id"),
+  };
+}
+
+function validateRequestVerificationRequest(raw: unknown): { requester_id: string; verifier_id: string; claim: string; evidence_needed: string; files_to_check?: string[] } {
+  const b = validateBody(raw);
+  return {
+    requester_id: validateString(b.requester_id, "requester_id"),
+    verifier_id: validateString(b.verifier_id, "verifier_id"),
+    claim: validateString(b.claim, "claim"),
+    evidence_needed: typeof b.evidence_needed === "string" ? b.evidence_needed : "",
+    files_to_check: validateOptionalStringArray(b.files_to_check, "files_to_check"),
+  };
+}
+
+function validateRespondVerificationRequest(raw: unknown): { verification_id: string; verifier_id: string; status: string; response: string; evidence?: string } {
+  const b = validateBody(raw);
+  const status = validateString(b.status, "status");
+  if (status !== "verified" && status !== "failed")
+    throw new ValidationError("'status' must be 'verified' or 'failed'");
+  return {
+    verification_id: validateString(b.verification_id, "verification_id"),
+    verifier_id: validateString(b.verifier_id, "verifier_id"),
+    status,
+    response: validateString(b.response, "response"),
+    evidence: typeof b.evidence === "string" ? b.evidence : undefined,
+  };
+}
+
+function validateListVerificationsRequest(raw: unknown): { peer_id?: string; status?: string } {
+  const b = validateBody(raw);
+  return {
+    peer_id: typeof b.peer_id === "string" ? b.peer_id : undefined,
+    status: typeof b.status === "string" ? b.status : undefined,
+  };
+}
+
+function validateCreateProposalRequest(raw: unknown): { author_id: string; title: string; description?: string; required_votes?: number } {
+  const b = validateBody(raw);
+  return {
+    author_id: validateString(b.author_id, "author_id"),
+    title: validateString(b.title, "title"),
+    description: typeof b.description === "string" ? b.description : undefined,
+    required_votes: typeof b.required_votes === "number" ? b.required_votes : undefined,
+  };
+}
+
+function validateVoteProposalRequest(raw: unknown): { proposal_id: string; voter_id: string; vote: string; reason?: string } {
+  const b = validateBody(raw);
+  const vote = validateString(b.vote, "vote");
+  if (vote !== "approve" && vote !== "reject")
+    throw new ValidationError("'vote' must be 'approve' or 'reject'");
+  return {
+    proposal_id: validateString(b.proposal_id, "proposal_id"),
+    voter_id: validateString(b.voter_id, "voter_id"),
+    vote,
+    reason: typeof b.reason === "string" ? b.reason : undefined,
+  };
+}
+
+function validateListProposalsRequest(raw: unknown): { status?: string } {
+  const b = validateBody(raw);
+  return {
+    status: typeof b.status === "string" ? b.status : undefined,
+  };
+}
+
 // --- Generate peer ID ---
 
 function generateId(): string {
@@ -1261,13 +1378,10 @@ function buildStructuredText(msgType: string, meta: any): string {
   }
 }
 
-function handleSendStructured(body: any): { ok: boolean; error?: string } {
+function handleSendStructured(body: { from_id: string; to_id: string; msg_type: string; context_snapshot?: string | null; [key: string]: unknown }): { ok: boolean; error?: string } {
   const fromId = body.from_id;
   const toId = body.to_id;
   const msgType = body.msg_type;
-
-  if (!fromId || !toId || !msgType) return { ok: false, error: "Missing from_id, to_id, or msg_type" };
-  if (!STRUCTURED_MSG_TYPES.includes(msgType)) return { ok: false, error: `Invalid msg_type. Use: ${STRUCTURED_MSG_TYPES.join(", ")}` };
 
   // Validate type-specific required fields
   switch (msgType) {
@@ -1885,31 +1999,31 @@ Bun.serve({
 
         // --- Structured Messages ---
         case "/send-structured":
-          return Response.json(handleSendStructured(body));
+          return Response.json(handleSendStructured(validateSendStructuredRequest(body)));
 
         // --- Decisions Board ---
         case "/post-decision":
-          return Response.json(handlePostDecision(body as any));
+          return Response.json(handlePostDecision(validatePostDecisionRequest(body)));
         case "/list-decisions":
-          return Response.json(handleListDecisions(body as any));
+          return Response.json(handleListDecisions(validateListDecisionsRequest(body)));
         case "/revoke-decision":
-          return Response.json(handleRevokeDecision(body as any));
+          return Response.json(handleRevokeDecision(validateRevokeDecisionRequest(body)));
 
         // --- Verification Protocol ---
         case "/request-verification":
-          return Response.json(handleRequestVerification(body as any));
+          return Response.json(handleRequestVerification(validateRequestVerificationRequest(body)));
         case "/respond-verification":
-          return Response.json(handleRespondVerification(body as any));
+          return Response.json(handleRespondVerification(validateRespondVerificationRequest(body)));
         case "/list-verifications":
-          return Response.json(handleListVerifications(body as any));
+          return Response.json(handleListVerifications(validateListVerificationsRequest(body)));
 
         // --- Consensus Protocol ---
         case "/create-proposal":
-          return Response.json(handleCreateProposal(body as any));
+          return Response.json(handleCreateProposal(validateCreateProposalRequest(body)));
         case "/vote-proposal":
-          return Response.json(handleVoteProposal(body as any));
+          return Response.json(handleVoteProposal(validateVoteProposalRequest(body)));
         case "/list-proposals":
-          return Response.json(handleListProposals(body as any));
+          return Response.json(handleListProposals(validateListProposalsRequest(body)));
 
         default:
           return Response.json({ error: "not found" }, { status: 404 });
